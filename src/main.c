@@ -454,13 +454,7 @@ int main(void) {
                         if (g_hot_ops.resolvedRegisterCallbackWithEventMaskCode != 0) {
                             g_cold.writeString(in, displayCallback);
 
-                            int64_t event_mask = 0;
-                            if (g_hot_ops.resolvedEventFlagDisplayChanged != 0)
-                                event_mask |= g_hot_ops.resolvedEventFlagDisplayChanged;
-                            if (g_hot_ops.resolvedEventFlagDisplayBrightness != 0)
-                                event_mask |= g_hot_ops.resolvedEventFlagDisplayBrightness;
-                            if (event_mask == 0)
-                                event_mask = 0xFFFFFFFFLL;
+                            int64_t event_mask = 2 | 4;
                             g_hot_ops.writeInt64(in, event_mask);
                         } else if (g_hot_ops.resolvedRegisterCallbackCode != 0) {
                             g_cold.writeString(in, displayCallback);

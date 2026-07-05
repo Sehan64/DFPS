@@ -317,9 +317,7 @@ static int resolveAllFields(const char* jar_path,
                             transaction_code_t* register_cb_mask,
                             transaction_code_t* register_cb,
                             transaction_code_t* register_batt_listener,
-                            transaction_code_t* batt_changed,
-                            int32_t* event_flag_changed,
-                            int32_t* event_flag_brightness) {
+                            transaction_code_t* batt_changed) {
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0) return -1;
 
@@ -363,10 +361,6 @@ static int resolveAllFields(const char* jar_path,
             (char*)"TRANSACTION_registerListener",
         (char*)"android.os.IBatteryPropertiesListener$Stub",
             (char*)"TRANSACTION_batteryPropertiesChanged",
-        (char*)"android.hardware.display.DisplayManager",
-            (char*)"EVENT_FLAG_DISPLAY_CHANGED",
-        (char*)"android.hardware.display.DisplayManager",
-            (char*)"EVENT_FLAG_DISPLAY_BRIGHTNESS",
         NULL
     };
 
@@ -440,10 +434,6 @@ static int resolveAllFields(const char* jar_path,
                     *register_batt_listener = (transaction_code_t)val;
                 else if (strcmp(field, "TRANSACTION_batteryPropertiesChanged") == 0)
                     *batt_changed = (transaction_code_t)val;
-                else if (strcmp(field, "EVENT_FLAG_DISPLAY_CHANGED") == 0)
-                    *event_flag_changed = (int32_t)val;
-                else if (strcmp(field, "EVENT_FLAG_DISPLAY_BRIGHTNESS") == 0)
-                    *event_flag_brightness = (int32_t)val;
             }
         }
         line = strtok_r(NULL, "\n", &saveptr);
@@ -477,7 +467,6 @@ void resolveTransactionCodes(void) {
         transaction_code_t is_interactive = 0, is_power_save = 0, get_brightness = 0;
         transaction_code_t on_display_event = 0, register_cb_mask = 0, register_cb = 0;
         transaction_code_t register_batt_listener = 0, batt_changed = 0;
-        int32_t event_flag_changed = 0, event_flag_brightness = 0;
 
         while (fgets(line, sizeof(line), cache_f)) {
             char key[128];
@@ -501,14 +490,12 @@ void resolveTransactionCodes(void) {
                     else if (strcmp(key, "TRANSACTION_registerCallback") == 0) register_cb = val;
                     else if (strcmp(key, "TRANSACTION_registerListener") == 0) register_batt_listener = val;
                     else if (strcmp(key, "TRANSACTION_batteryPropertiesChanged") == 0) batt_changed = val;
-                    else if (strcmp(key, "EVENT_FLAG_DISPLAY_CHANGED") == 0) event_flag_changed = val;
-                    else if (strcmp(key, "EVENT_FLAG_DISPLAY_BRIGHTNESS") == 0) event_flag_brightness = val;
                 }
             }
         }
         fclose(cache_f);
 
-        if (version == 8 && strcmp(cached_fp, current_fp) == 0 &&
+        if (version == 1 && strcmp(cached_fp, current_fp) == 0 &&
             observer && (rootTask || stackTask) && fg && is_interactive &&
             (register_cb_mask || register_cb)) {
             g_cold.resolvedProcessObserverCode = observer;
@@ -528,8 +515,6 @@ void resolveTransactionCodes(void) {
             g_hot_ops.resolvedRegisterCallbackCode = register_cb;
             g_hot_ops.resolvedRegisterBatteryListenerCode = register_batt_listener;
             g_hot_ops.resolvedBatteryChangedCode = batt_changed;
-            g_hot_ops.resolvedEventFlagDisplayChanged = event_flag_changed;
-            g_hot_ops.resolvedEventFlagDisplayBrightness = event_flag_brightness;
             return;
         }
         LOGW("Transaction code cache invalid or outdated. Regenerating...");
@@ -574,13 +559,11 @@ void resolveTransactionCodes(void) {
     transaction_code_t is_interactive = 0, is_power_save = 0, get_brightness = 0;
     transaction_code_t on_display_event = 0, register_cb_mask = 0, register_cb = 0;
     transaction_code_t register_batt_listener = 0, batt_changed = 0;
-    int32_t event_flag_changed = 0, event_flag_brightness = 0;
 
     if (resolveAllFields(jar_path, &observer, &rootTask, &stackTask, &fg,
                           &is_interactive, &is_power_save, &get_brightness,
                           &on_display_event, &register_cb_mask, &register_cb,
-                          &register_batt_listener, &batt_changed,
-                          &event_flag_changed, &event_flag_brightness) == 0) {
+                          &register_batt_listener, &batt_changed) == 0) {
         g_cold.resolvedProcessObserverCode = observer;
         if (rootTask) {
             g_hot_ops.resolvedFocusedTaskCode = rootTask;
@@ -598,8 +581,6 @@ void resolveTransactionCodes(void) {
         g_hot_ops.resolvedRegisterCallbackCode = register_cb;
         g_hot_ops.resolvedRegisterBatteryListenerCode = register_batt_listener;
         g_hot_ops.resolvedBatteryChangedCode = batt_changed;
-        g_hot_ops.resolvedEventFlagDisplayChanged = event_flag_changed;
-        g_hot_ops.resolvedEventFlagDisplayBrightness = event_flag_brightness;
 
         /* Write cache for next startup atomically (temp file + rename). */
         char tmp_cache_path[256];
@@ -611,7 +592,7 @@ void resolveTransactionCodes(void) {
         FILE* out_cache_f = out_cache_fd >= 0 ? fdopen(out_cache_fd, "w") : NULL;
         if (out_cache_f) {
             int ok = 1;
-            ok = ok && fprintf(out_cache_f, "v=8\n") > 0;
+            ok = ok && fprintf(out_cache_f, "v=1\n") > 0;
             ok = ok && fprintf(out_cache_f, "fingerprint=%s\n", current_fp) > 0;
             ok = ok && fprintf(out_cache_f, "TRANSACTION_registerProcessObserver=%u\n", observer) > 0;
             ok = ok && fprintf(out_cache_f, "TRANSACTION_getFocusedRootTaskInfo=%u\n", rootTask) > 0;
@@ -625,8 +606,6 @@ void resolveTransactionCodes(void) {
             ok = ok && fprintf(out_cache_f, "TRANSACTION_registerCallback=%u\n", register_cb) > 0;
             ok = ok && fprintf(out_cache_f, "TRANSACTION_registerListener=%u\n", register_batt_listener) > 0;
             ok = ok && fprintf(out_cache_f, "TRANSACTION_batteryPropertiesChanged=%u\n", batt_changed) > 0;
-            ok = ok && fprintf(out_cache_f, "EVENT_FLAG_DISPLAY_CHANGED=%d\n", event_flag_changed) > 0;
-            ok = ok && fprintf(out_cache_f, "EVENT_FLAG_DISPLAY_BRIGHTNESS=%d\n", event_flag_brightness) > 0;
             if (fflush(out_cache_f) != 0) ok = 0;
             if (ok && fsync(fileno(out_cache_f)) != 0) ok = 0;
             if (fclose(out_cache_f) != 0) ok = 0;

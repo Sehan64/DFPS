@@ -151,8 +151,6 @@ typedef struct __attribute__((aligned(64))) {
     transaction_code_t    resolvedRegisterCallbackCode;
     transaction_code_t    resolvedRegisterBatteryListenerCode;
     transaction_code_t    resolvedBatteryChangedCode;
-    int32_t               resolvedEventFlagDisplayChanged;
-    int32_t               resolvedEventFlagDisplayBrightness;
 } HotOps;
 
 typedef struct {
