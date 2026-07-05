@@ -22,10 +22,34 @@ void loadModesMap(void) {
     ModeMapEntry temp_modes[MAX_MODES];
     int temp_mode_count = 0;
     int32_t temp_max_rate = 0, temp_min_rate = 0;
-    int32_t id, rate;
+    char line[256];
     int line_num = 0;
-    while (fscanf(f, "%d %d", &rate, &id) == 2) {
+    while (fgets(line, sizeof(line), f)) {
         line_num++;
+        char* hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+
+        char* p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '\0') continue;
+
+        char* end = NULL;
+        long parsed_rate = strtol(p, &end, 10);
+        if (end == p) {
+            LOGW("modes.map line %d: ignored malformed line", line_num);
+            continue;
+        }
+
+        p = end;
+        while (isspace((unsigned char)*p)) p++;
+        long parsed_id = strtol(p, &end, 10);
+        if (end == p) {
+            LOGW("modes.map line %d: ignored malformed line", line_num);
+            continue;
+        }
+
+        int32_t rate = (int32_t)parsed_rate;
+        int32_t id = (int32_t)parsed_id;
         if (rate <= 0 || rate > 1000) {
             LOGW("modes.map line %d: rejected absurd rate %d", line_num, rate);
             continue;
