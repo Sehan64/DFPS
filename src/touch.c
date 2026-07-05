@@ -139,11 +139,13 @@ static void handleInotifyEvents(void) {
 static inline void updateTouchStateFromEvent(const struct input_event* ev,
                                              bool use_tracking_fallback,
                                              bool* saw_state,
+                                             bool* saw_active,
                                              bool* final_touching) {
     if (ev->type == EV_KEY && ev->code == BTN_TOUCH) {
         if (ev->value == 0 || ev->value == 1) {
             *saw_state = true;
             *final_touching = (ev->value == 1);
+            if (ev->value == 1) *saw_active = true;
         }
         return;
     }
@@ -152,6 +154,7 @@ static inline void updateTouchStateFromEvent(const struct input_event* ev,
         ev->type == EV_ABS && ev->code == ABS_MT_TRACKING_ID) {
         *saw_state = true;
         *final_touching = (ev->value >= 0);
+        if (ev->value >= 0) *saw_active = true;
     }
 }
 
@@ -273,6 +276,7 @@ void* touchListenerThread(void* arg) {
             if (kind == FD_TOUCH) {
                 if (revents & EPOLLIN) {
                     bool saw_touch_state = false;
+                    bool saw_active_touch = false;
                     bool final_touching = atomic_load_explicit(&g_touching,
                                                                memory_order_relaxed);
                     bool use_tracking_fallback = false;
@@ -293,15 +297,25 @@ void* touchListenerThread(void* arg) {
                         for (size_t k = 0; k < count; k++) {
                             updateTouchStateFromEvent(&evs[k], use_tracking_fallback,
                                                       &saw_touch_state,
+                                                      &saw_active_touch,
                                                       &final_touching);
                         }
                     }
 
                     if (saw_touch_state) {
-                        atomic_store_explicit(&g_touching, final_touching,
-                                              memory_order_relaxed);
-                        atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
-                        needs_rate_update = true;
+                        bool old_touching = atomic_load_explicit(&g_touching,
+                                                                 memory_order_relaxed);
+                        if (old_touching != final_touching) {
+                            atomic_store_explicit(&g_touching, final_touching,
+                                                  memory_order_relaxed);
+                            atomic_store_explicit(&g_last_touch_time, now,
+                                                  memory_order_relaxed);
+                            needs_rate_update = true;
+                        } else if (!final_touching && saw_active_touch) {
+                            atomic_store_explicit(&g_last_touch_time, now,
+                                                  memory_order_relaxed);
+                            needs_rate_update = true;
+                        }
                     }
                 }
                 continue;

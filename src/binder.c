@@ -221,7 +221,6 @@ static inline void emitChangedForegroundPackages(void) {
         first_pkg[slash_len] = '\0';
 
         updateCurrentAppRates(first_pkg);
-        triggerPollerWakeup();
     }
 
     if (snap_count > 0) {

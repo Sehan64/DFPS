@@ -137,6 +137,7 @@ void setRefreshRate(int32_t rate) {
 
 void updateRateState(void) {
     bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
+    int32_t target_rate = -1;
 
     /* Snapshot config values under a single read lock */
     pthread_rwlock_rdlock(&g_config_lock);
@@ -148,36 +149,36 @@ void updateRateState(void) {
     if (!interactive) {
         if (offscreen > 0) {
             LOG_HOT("Device offscreen state evaluated.");
-            setRefreshRate(offscreen);
+            target_rate = offscreen;
         }
-        return;
-    }
-
-    if (atomic_load_explicit(&g_min_brightness_clamp, memory_order_acquire)) {
-        int32_t target_rate = (min_phys > 0) ? min_phys : def_idle;
-        setRefreshRate(target_rate);
-        return;
-    }
-
-    uint64_t now = getNowMs();
-    uint64_t last_touch = atomic_load_explicit(&g_last_touch_time, memory_order_relaxed);
-    bool touching = atomic_load_explicit(&g_touching, memory_order_relaxed);
-    int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);
-
-    if (touching || (now - last_touch < (uint64_t)slack)) {
-        int32_t active_rate = atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed);
-        if (atomic_load_explicit(&g_power_save_mode, memory_order_acquire) ||
-            atomic_load_explicit(&g_low_battery_mode, memory_order_acquire)) {
-            int32_t max_rate = atomic_load_explicit(&g_power_save_max_rate,
-                                                     memory_order_relaxed);
-            if (active_rate > max_rate) {
-                active_rate = max_rate;
-            }
-        }
-        setRefreshRate(active_rate);
+    } else if (atomic_load_explicit(&g_min_brightness_clamp, memory_order_acquire)) {
+        target_rate = (min_phys > 0) ? min_phys : def_idle;
     } else {
-        setRefreshRate(atomic_load_explicit(&g_curr_idle_rate, memory_order_relaxed));
+        uint64_t now = getNowMs();
+        uint64_t last_touch = atomic_load_explicit(&g_last_touch_time, memory_order_relaxed);
+        bool touching = atomic_load_explicit(&g_touching, memory_order_relaxed);
+        int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);
+
+        if (touching || (now - last_touch < (uint64_t)slack)) {
+            int32_t active_rate = atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed);
+            if (atomic_load_explicit(&g_power_save_mode, memory_order_acquire) ||
+                atomic_load_explicit(&g_low_battery_mode, memory_order_acquire)) {
+                int32_t max_rate = atomic_load_explicit(&g_power_save_max_rate,
+                                                         memory_order_relaxed);
+                if (active_rate > max_rate) {
+                    active_rate = max_rate;
+                }
+            }
+            target_rate = active_rate;
+        } else {
+            target_rate = atomic_load_explicit(&g_curr_idle_rate, memory_order_relaxed);
+        }
     }
+
+    if (target_rate <= 0) return;
+    if (atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == target_rate) return;
+
+    setRefreshRate(target_rate);
 }
 
 void updateCurrentAppRates(const char* pkg) {
