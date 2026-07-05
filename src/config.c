@@ -76,6 +76,7 @@ void loadModesMap(void) {
     }
     g_max_physical_rate = temp_max_rate;
     g_min_physical_rate = temp_min_rate;
+    invalidateRateModeCache();
     pthread_rwlock_unlock(&g_config_lock);
 
     LOGI("Loaded %d SurfaceFlinger mode mappings successfully.", g_mode_count);
@@ -159,6 +160,8 @@ void loadConfig(void) {
         char* key = line;
         char* val = eq + 1;
 
+        while (isspace((unsigned char)*key)) key++;
+        if (*key == '\0') continue;
         char* key_end = key + strlen(key) - 1;
         while (key_end > key && isspace((unsigned char)*key_end)) *key_end-- = '\0';
         while (isspace((unsigned char)*val)) val++;
@@ -270,9 +273,18 @@ void loadConfig(void) {
     pthread_rwlock_unlock(&g_config_lock);
 
     atomic_store_explicit(&g_touch_slack_ms, temp_slack, memory_order_release);
-    atomic_store_explicit(&g_enable_min_brightness, temp_min_bright, memory_order_release);
+    bool old_min_bright = atomic_exchange_explicit(
+        &g_enable_min_brightness, temp_min_bright, memory_order_acq_rel);
+    if (old_min_bright && !temp_min_bright) {
+        atomic_store_explicit(&g_min_brightness_clamp, false, memory_order_release);
+    }
     atomic_store_explicit(&g_min_brightness_threshold, temp_min_bright_threshold, memory_order_release);
-    atomic_store_explicit(&g_battery_saver, temp_battery_saver, memory_order_release);
+    bool old_battery_saver = atomic_exchange_explicit(
+        &g_battery_saver, temp_battery_saver, memory_order_acq_rel);
+    if (old_battery_saver && !temp_battery_saver) {
+        atomic_store_explicit(&g_power_save_mode, false, memory_order_release);
+        atomic_store_explicit(&g_low_battery_mode, false, memory_order_release);
+    }
     atomic_store_explicit(&g_low_battery_threshold, temp_low_battery_threshold, memory_order_release);
     atomic_store_explicit(&g_power_save_max_rate, temp_power_save_max_rate, memory_order_release);
 

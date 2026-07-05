@@ -221,6 +221,8 @@ static inline void emitChangedForegroundPackages(void) {
         first_pkg[slash_len] = '\0';
 
         updateCurrentAppRates(first_pkg);
+    } else {
+        updateCurrentAppRates("");
     }
 
     if (snap_count > 0) {
@@ -271,10 +273,13 @@ void queryFocusedTask(void) {
 
     int32_t present = 0;
     if (__builtin_expect(g_hot_ops.readInt32(reply, &present) != STATUS_OK || !present, 0)) {
+        g_child_task_count = 0;
         g_hot_ops.deleteParcel(reply);
+        emitChangedForegroundPackages();
         return;
     }
 
+    g_child_task_count = 0;
     if (__builtin_expect(g_hot_ops.resolvedApi == API_ROOT_TASK_INFO, 1)) {
         parseRootTaskInfoReply(reply);
     } else {
@@ -449,7 +454,7 @@ static int resolveAllFields(const char* jar_path,
 
 __attribute__((cold))
 void resolveTransactionCodes(void) {
-    const char* cache_path = "/data/local/tmp/tx_code.txt";
+    const char* cache_path = "/data/local/tmp/dfps/tx_code.txt";
 
     char current_fp[256] = {0};
     __system_property_get("ro.build.fingerprint", current_fp);
@@ -458,7 +463,12 @@ void resolveTransactionCodes(void) {
     }
 
     /* Try loading from cache first */
-    FILE* cache_f = fopen(cache_path, "r");
+    FILE* cache_f = NULL;
+    int cache_fd = open(cache_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (cache_fd >= 0) {
+        cache_f = fdopen(cache_fd, "r");
+        if (!cache_f) close(cache_fd);
+    }
     if (cache_f) {
         char line[256];
         int version = 0;
@@ -540,11 +550,16 @@ void resolveTransactionCodes(void) {
         return;
     }
 
-    const char* jar_path = "/data/local/tmp/resolver.jar";
+    char jar_path_buf[256];
+    snprintf(jar_path_buf, sizeof(jar_path_buf),
+             "/data/local/tmp/dfps/resolver.%ld.jar", (long)getpid());
+    const char* jar_path = jar_path_buf;
     /* Use 0600: only this UID can read/execute the helper. The directory is
      * still world-writable on many devices, but this removes the world-read bit
      * from the file itself. */
-    int fd = open(jar_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    int fd = open(jar_path,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
     if (fd < 0) { LOGE("Failed to write helper to %s", jar_path); return; }
     ssize_t written = write(fd, resolver_jar, RESOLVER_SIZE);
     close(fd);
@@ -588,8 +603,12 @@ void resolveTransactionCodes(void) {
 
         /* Write cache for next startup atomically (temp file + rename). */
         char tmp_cache_path[256];
-        snprintf(tmp_cache_path, sizeof(tmp_cache_path), "%s.tmp", cache_path);
-        FILE* out_cache_f = fopen(tmp_cache_path, "w");
+        snprintf(tmp_cache_path, sizeof(tmp_cache_path),
+                 "%s.%ld.tmp", cache_path, (long)getpid());
+        int out_cache_fd = open(tmp_cache_path,
+                                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                                0600);
+        FILE* out_cache_f = out_cache_fd >= 0 ? fdopen(out_cache_fd, "w") : NULL;
         if (out_cache_f) {
             int ok = 1;
             ok = ok && fprintf(out_cache_f, "v=8\n") > 0;
@@ -608,17 +627,28 @@ void resolveTransactionCodes(void) {
             ok = ok && fprintf(out_cache_f, "TRANSACTION_batteryPropertiesChanged=%u\n", batt_changed) > 0;
             ok = ok && fprintf(out_cache_f, "EVENT_FLAG_DISPLAY_CHANGED=%d\n", event_flag_changed) > 0;
             ok = ok && fprintf(out_cache_f, "EVENT_FLAG_DISPLAY_BRIGHTNESS=%d\n", event_flag_brightness) > 0;
+            if (fflush(out_cache_f) != 0) ok = 0;
+            if (ok && fsync(fileno(out_cache_f)) != 0) ok = 0;
             if (fclose(out_cache_f) != 0) ok = 0;
             if (ok) {
                 if (rename(tmp_cache_path, cache_path) != 0) {
                     LOGW("Transaction code cache rename failed: %s", strerror(errno));
                     unlink(tmp_cache_path);
+                } else {
+                    int dir_fd = open("/data/local/tmp/dfps",
+                                      O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                    if (dir_fd >= 0) {
+                        (void)fsync(dir_fd);
+                        close(dir_fd);
+                    }
                 }
             } else {
                 LOGW("Transaction code cache write failed (disk full or I/O error). "
                      "Codes will be re-resolved on next startup.");
                 unlink(tmp_cache_path);
             }
+        } else if (out_cache_fd >= 0) {
+            close(out_cache_fd);
         }
     } else {
         LOGE("Failed to resolve transaction codes via app_process.");

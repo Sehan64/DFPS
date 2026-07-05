@@ -400,6 +400,7 @@ void rebuildRuleHash(void);
 
 /* rate.c */
 void setSurfaceFlingerFrameRateFlex(bool enable);
+void invalidateRateModeCache(void);
 void setRefreshRate(int32_t rate);
 void updateRateState(void);
 void updateCurrentAppRates(const char* pkg);
@@ -441,6 +442,7 @@ void    evaluateBatteryState(int32_t level);
 bool    handleUevent(void);
 
 /* touch.c */
+bool  consumeShutdownSignal(void);
 void  findTouchscreens(void);
 void* touchListenerThread(void* arg);
 

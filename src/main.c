@@ -48,6 +48,7 @@ _Atomic bool      g_screen_interactive = true;
 _Atomic bool      g_touching = false;
 bool              g_root_mode = false;
 _Atomic bool      g_shutdown_requested = false;
+static volatile sig_atomic_t s_shutdown_signal_seen = 0;
 
 
 /* Battery / power */
@@ -169,19 +170,21 @@ static void setupCpuAffinity(void) {
 
 __attribute__((cold))
 static void shutdownHandler(int sig) {
-    (void)sig;
-    static _Atomic bool handled = false;
-    if (atomic_exchange_explicit(&handled, true, memory_order_acq_rel)) {
-        return; /* Already handling — second signal forces exit. */
+    if (s_shutdown_signal_seen) {
+        _exit(128 + sig);
     }
-    LOGI("Shutdown requested (signal %d) — stopping daemon.", sig);
+    s_shutdown_signal_seen = 1;
+
+    if (g_wakeup_fd >= 0) {
+        uint64_t val = 1;
+        (void)write(g_wakeup_fd, &val, sizeof(val));
+    }
+}
+
+bool consumeShutdownSignal(void) {
+    if (!s_shutdown_signal_seen) return false;
     atomic_store_explicit(&g_shutdown_requested, true, memory_order_release);
-    triggerPollerWakeup();
-    /* Give the poller thread a moment to notice and begin cleanup, then
-     * terminate. The binder thread pool cannot be interrupted cleanly from
-     * NDK, so process exit is the practical shutdown path. */
-    usleep(100000);
-    exit(0);
+    return true;
 }
 
 /* ================================================================== */

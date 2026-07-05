@@ -9,6 +9,8 @@
 #include "dfps.h"
 
 static bool s_touch_tracking_fallback[MAX_TOUCH_DEVICES];
+static unsigned long s_touch_active_slots[MAX_TOUCH_DEVICES];
+static int s_touch_current_slot[MAX_TOUCH_DEVICES];
 
 /* ================================================================== */
 /*  Touch device discovery                                             */
@@ -61,6 +63,8 @@ void findTouchscreens(void) {
 
                 if (is_touch && g_touch_fd_count < MAX_TOUCH_DEVICES) {
                     s_touch_tracking_fallback[g_touch_fd_count] = !has_btn_touch;
+                    s_touch_active_slots[g_touch_fd_count] = 0;
+                    s_touch_current_slot[g_touch_fd_count] = 0;
                     g_touch_fds[g_touch_fd_count++] = fd;
                     LOGI("  - Registered input device: %s", path);
                 } else {
@@ -127,6 +131,9 @@ static void handleInotifyEvents(void) {
                 /* No foreground app observed yet — still propagate new defaults */
                 updateCurrentAppRates("");
             }
+        } else if (event->len > 0 && strcmp(event->name, "modes.map") == 0) {
+            LOGI("Mode map modification event triggered.");
+            loadModesMap();
         }
         ptr += sizeof(struct inotify_event) + event->len;
     }
@@ -137,6 +144,7 @@ static void handleInotifyEvents(void) {
 /* ================================================================== */
 
 static inline void updateTouchStateFromEvent(const struct input_event* ev,
+                                             int device_index,
                                              bool use_tracking_fallback,
                                              bool* saw_state,
                                              bool* saw_active,
@@ -150,11 +158,30 @@ static inline void updateTouchStateFromEvent(const struct input_event* ev,
         return;
     }
 
-    if (use_tracking_fallback &&
-        ev->type == EV_ABS && ev->code == ABS_MT_TRACKING_ID) {
+    if (!use_tracking_fallback || device_index < 0 ||
+        device_index >= MAX_TOUCH_DEVICES || ev->type != EV_ABS) {
+        return;
+    }
+
+    if (ev->code == ABS_MT_SLOT) {
+        if (ev->value >= 0 &&
+            ev->value < (int)(sizeof(s_touch_active_slots[device_index]) * CHAR_BIT)) {
+            s_touch_current_slot[device_index] = ev->value;
+        }
+        return;
+    }
+
+    if (ev->code == ABS_MT_TRACKING_ID) {
+        int slot = s_touch_current_slot[device_index];
+        unsigned long bit = 1UL << slot;
         *saw_state = true;
-        *final_touching = (ev->value >= 0);
-        if (ev->value >= 0) *saw_active = true;
+        if (ev->value >= 0) {
+            s_touch_active_slots[device_index] |= bit;
+            *saw_active = true;
+        } else {
+            s_touch_active_slots[device_index] &= ~bit;
+        }
+        *final_touching = (s_touch_active_slots[device_index] != 0);
     }
 }
 
@@ -228,6 +255,7 @@ void* touchListenerThread(void* arg) {
     uint64_t now = getNowMs();
 
     while (!atomic_load_explicit(&g_shutdown_requested, memory_order_acquire)) {
+        if (consumeShutdownSignal()) break;
         int timeout = getPollTimeout(now);
         int nfds = epoll_wait(epfd, events, MAX_EVENTS, timeout);
         if (nfds < 0) {
@@ -259,6 +287,10 @@ void* touchListenerThread(void* arg) {
          * there is no need to ADD/DEL them repeatedly. */
         bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
         if (!interactive) {
+            for (int t = 0; t < g_touch_fd_count; t++) {
+                s_touch_active_slots[t] = 0;
+                s_touch_current_slot[t] = 0;
+            }
             if (atomic_load_explicit(&g_touching, memory_order_relaxed)) {
                 atomic_store_explicit(&g_touching, false, memory_order_relaxed);
                 atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
@@ -280,8 +312,10 @@ void* touchListenerThread(void* arg) {
                     bool final_touching = atomic_load_explicit(&g_touching,
                                                                memory_order_relaxed);
                     bool use_tracking_fallback = false;
+                    int device_index = -1;
                     for (int t = 0; t < g_touch_fd_count; t++) {
                         if (g_touch_fds[t] == fd) {
+                            device_index = t;
                             use_tracking_fallback = s_touch_tracking_fallback[t];
                             break;
                         }
@@ -295,7 +329,8 @@ void* touchListenerThread(void* arg) {
                         }
                         size_t count = n / sizeof(struct input_event);
                         for (size_t k = 0; k < count; k++) {
-                            updateTouchStateFromEvent(&evs[k], use_tracking_fallback,
+                            updateTouchStateFromEvent(&evs[k], device_index,
+                                                      use_tracking_fallback,
                                                       &saw_touch_state,
                                                       &saw_active_touch,
                                                       &final_touching);
@@ -329,6 +364,10 @@ void* touchListenerThread(void* arg) {
                         LOGE("eventfd read failed: %s", strerror(errno));
                     }
                     atomic_flag_clear_explicit(&g_wakeup_pending, memory_order_release);
+                    if (consumeShutdownSignal()) {
+                        needs_rate_update = false;
+                        continue;
+                    }
 
                     if (atomic_exchange_explicit(&g_query_task_pending, false,
                                                   memory_order_acq_rel)) {
@@ -385,22 +424,20 @@ void* touchListenerThread(void* arg) {
                                      g_client_count);
 
                                 /* Send current foreground packages to new client */
-                                if (g_last_package_count > 0) {
-                                    char snap_buf[1024];
-                                    int snap_offset = 0;
-                                    for (int p = 0; p < g_last_package_count; p++) {
-                                        if (p > 0) snap_buf[snap_offset++] = ' ';
-                                        int len = g_last_package_prefixes[p].len;
-                                        if (snap_offset + len < 1000) {
-                                            memcpy(snap_buf + snap_offset,
-                                                   g_last_package_prefixes[p].buf, len);
-                                            snap_offset += len;
-                                        }
+                                char snap_buf[1024];
+                                int snap_offset = 0;
+                                for (int p = 0; p < g_last_package_count; p++) {
+                                    if (p > 0) snap_buf[snap_offset++] = ' ';
+                                    int len = g_last_package_prefixes[p].len;
+                                    if (snap_offset + len < 1000) {
+                                        memcpy(snap_buf + snap_offset,
+                                               g_last_package_prefixes[p].buf, len);
+                                        snap_offset += len;
                                     }
-                                    snap_buf[snap_offset++] = '\n';
-                                    send(client_fd, snap_buf, snap_offset,
-                                         MSG_NOSIGNAL | MSG_DONTWAIT);
                                 }
+                                snap_buf[snap_offset++] = '\n';
+                                send(client_fd, snap_buf, snap_offset,
+                                     MSG_NOSIGNAL | MSG_DONTWAIT);
                             }
                         } else {
                             LOGW("Abstract socket clients limit reached. "

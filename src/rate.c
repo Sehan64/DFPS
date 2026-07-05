@@ -15,6 +15,12 @@
 static int32_t s_last_rate_in  = -1;
 static int32_t s_last_id_out   = -1;
 
+void invalidateRateModeCache(void) {
+    s_last_rate_in = -1;
+    s_last_id_out = -1;
+    atomic_store_explicit(&g_last_set_rate, -1, memory_order_relaxed);
+}
+
 __attribute__((cold))
 static int32_t resolveRootId(int32_t rate) {
     if (rate == s_last_rate_in) return s_last_id_out;
@@ -56,10 +62,10 @@ static int32_t resolveRootId(int32_t rate) {
     return s_last_id_out;
 }
 
-static void setSfActiveConfigDirect(int32_t id) {
+static bool setSfActiveConfigDirect(int32_t id) {
     if (!g_hot_binders.surfaceFlinger) {
         LOGE("SurfaceFlinger binder missing in hot context.");
-        return;
+        return false;
     }
 
     AParcel* in = NULL;
@@ -70,11 +76,13 @@ static void setSfActiveConfigDirect(int32_t id) {
             g_hot_binders.surfaceFlinger, 1035, &in, &reply, 0);
         if (status == STATUS_OK) {
             if (reply) g_hot_ops.deleteParcel(reply);
-        } else {
-            if (reply) g_hot_ops.deleteParcel(reply);
-            LOGE("Direct SurfaceFlinger binder transaction 1035 failed: status %d", status);
+            return true;
         }
+        if (reply) g_hot_ops.deleteParcel(reply);
+        LOGE("Direct SurfaceFlinger binder transaction 1035 failed: status %d", status);
+        return false;
     }
+    return false;
 }
 
 /* ================================================================== */
@@ -123,13 +131,14 @@ void setRefreshRate(int32_t rate) {
     }
 
     if (atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == rate) return;
-    atomic_store_explicit(&g_last_set_rate, rate, memory_order_relaxed);
 
     LOG_HOT("Transitioning device physical refresh rate to: %d Hz", rate);
 
     int32_t id = resolveRootId(rate);
     if (id >= 0) {
-        setSfActiveConfigDirect(id);
+        if (setSfActiveConfigDirect(id)) {
+            atomic_store_explicit(&g_last_set_rate, rate, memory_order_relaxed);
+        }
     } else {
         LOGE("Failed mapping %d Hz to an ID in modes.map!", rate);
     }

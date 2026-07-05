@@ -13,6 +13,7 @@
 .RECIPEPREFIX := >
 
 SRC      := src/main.c src/utils.c src/config.c src/rate.c src/binder.c src/power.c src/touch.c
+PROFILE_STAMP = bin/$(ABI)/.profile-$(PROFILE)
 
 # Auto-detect architecture (common on Termux)
 ARCH := $(shell uname -m)
@@ -69,7 +70,12 @@ LDFLAGS += $(LDFLAGS_EXTRA)
 
 all: bin/$(ABI)/dfps
 
-bin/$(ABI)/dfps: $(SRC) src/dfps.h src/resolver_bytes.h
+$(PROFILE_STAMP):
+>@mkdir -p bin/$(ABI)
+>@rm -f bin/$(ABI)/.profile-*
+>@touch $@
+
+bin/$(ABI)/dfps: $(SRC) src/dfps.h src/resolver_bytes.h $(PROFILE_STAMP)
 >@mkdir -p bin/$(ABI)
 >@if [ ! -f src/resolver_bytes.h ] || [ "$$(wc -l < src/resolver_bytes.h)" -lt 2 ]; then \
 >    echo "WARNING: src/resolver_bytes.h looks like the placeholder."; \
@@ -77,7 +83,9 @@ bin/$(ABI)/dfps: $(SRC) src/dfps.h src/resolver_bytes.h
 >fi
 >@echo "Building dfps for $(ABI) ($(PROFILE), -march=$(BASE_ARCH))..."
 >@clang $(CFLAGS) $(SRC) -o $@ $(LDFLAGS)
->@llvm-strip $@ 2>/dev/null || strip $@ 2>/dev/null || true
+>@if [ "$(PROFILE)" = "release" ]; then \
+>    llvm-strip $@ 2>/dev/null || strip $@ 2>/dev/null || true; \
+>fi
 >@echo "-> $@"
 >@ls -lh $@
 
@@ -85,7 +93,7 @@ debug:
 >@$(MAKE) PROFILE=debug all
 
 check:
->@cd src && clang -fsyntax-only $(CFLAGS) main.c \
+>@clang -fsyntax-only $(CFLAGS) $(SRC) \
 >    && echo "syntax OK (Termux clang)"
 
 # Convenience targets
