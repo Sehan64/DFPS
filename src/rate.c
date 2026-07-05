@@ -1,0 +1,200 @@
+/*
+ * rate.c — Refresh rate control logic
+ *
+ * Decides and applies the display refresh rate based on touch state,
+ * per-app rules, battery constraints, and brightness clamping.
+ */
+
+#include "dfps.h"
+
+/* ================================================================== */
+/*  Internal helpers (file-local)                                      */
+/* ================================================================== */
+
+/* One-entry cache for the rate-to-SurfaceFlinger-ID mapping. */
+static int32_t s_last_rate_in  = -1;
+static int32_t s_last_id_out   = -1;
+
+__attribute__((cold))
+static int32_t resolveRootId(int32_t rate) {
+    if (rate == s_last_rate_in) return s_last_id_out;
+    s_last_rate_in = rate;
+
+    if (g_mode_count == 0) {
+        s_last_id_out = -1;
+        return -1;
+    }
+
+    /* Exact match */
+    for (int i = 0; i < g_mode_count; i++) {
+        if (g_modes[i].rate == rate) {
+            s_last_id_out = g_modes[i].id;
+            return s_last_id_out;
+        }
+    }
+
+    /* Closest match — cap at 30 Hz difference to avoid wildly wrong selections */
+    int32_t closest_id = -1, closest_rate = 0, min_diff = 30;
+    for (int i = 0; i < g_mode_count; i++) {
+        int32_t diff = abs(g_modes[i].rate - rate);
+        if (diff < min_diff) {
+            min_diff = diff;
+            closest_rate = g_modes[i].rate;
+            closest_id = g_modes[i].id;
+        }
+    }
+
+    if (closest_id != -1) {
+        LOGW("No exact match for %d Hz in modes.map. Using closest: %d Hz (ID: %d)",
+             rate, closest_rate, closest_id);
+        s_last_id_out = closest_id;
+        return s_last_id_out;
+    }
+
+    /* No reasonable mapping found — return error instead of conflating Hz with ID */
+    s_last_id_out = -1;
+    return s_last_id_out;
+}
+
+static void setSfActiveConfigDirect(int32_t id) {
+    if (!g_hot_binders.surfaceFlinger) {
+        LOGE("SurfaceFlinger binder missing in hot context.");
+        return;
+    }
+
+    AParcel* in = NULL;
+    if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) == STATUS_OK && in) {
+        g_hot_ops.writeInt32(in, id);
+        AParcel* reply = NULL;
+        binder_status_t status = g_hot_ops.transact(
+            g_hot_binders.surfaceFlinger, 1035, &in, &reply, 0);
+        if (status == STATUS_OK) {
+            if (reply) g_hot_ops.deleteParcel(reply);
+        } else {
+            if (reply) g_hot_ops.deleteParcel(reply);
+            LOGE("Direct SurfaceFlinger binder transaction 1035 failed: status %d", status);
+        }
+    }
+}
+
+/* ================================================================== */
+/*  Public interface                                                   */
+/* ================================================================== */
+
+void setRefreshRate(int32_t rate) {
+    if (rate <= 0) return;
+
+    if (g_max_physical_rate > 0 && rate > g_max_physical_rate) {
+        static _Atomic int32_t last_warned_rate = -1;
+        if (rate != atomic_load_explicit(&last_warned_rate, memory_order_relaxed)) {
+            LOGW("Requested rate %d Hz exceeds device maximum (%d Hz). "
+                 "Clamping output to %d Hz.",
+                 rate, g_max_physical_rate, g_max_physical_rate);
+            atomic_store_explicit(&last_warned_rate, rate, memory_order_relaxed);
+        }
+        rate = g_max_physical_rate;
+    }
+
+    if (atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == rate) return;
+    atomic_store_explicit(&g_last_set_rate, rate, memory_order_relaxed);
+
+    LOG_HOT("Transitioning device physical refresh rate to: %d Hz", rate);
+
+    int32_t id = resolveRootId(rate);
+    if (id >= 0) {
+        setSfActiveConfigDirect(id);
+    } else {
+        LOGE("Failed mapping %d Hz to an ID in modes.map!", rate);
+    }
+}
+
+void updateRateState(void) {
+    bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
+
+    /* Snapshot config values under a single read lock */
+    pthread_rwlock_rdlock(&g_config_lock);
+    int32_t offscreen = g_offscreen_rate;
+    int32_t min_phys  = g_min_physical_rate;
+    int32_t def_idle  = g_default_idle_rate;
+    pthread_rwlock_unlock(&g_config_lock);
+
+    if (!interactive) {
+        if (offscreen > 0) {
+            LOG_HOT("Device offscreen state evaluated.");
+            setRefreshRate(offscreen);
+        }
+        return;
+    }
+
+    if (atomic_load_explicit(&g_min_brightness_clamp, memory_order_acquire)) {
+        int32_t target_rate = (min_phys > 0) ? min_phys : def_idle;
+        setRefreshRate(target_rate);
+        return;
+    }
+
+    uint64_t now = getNowMs();
+    uint64_t last_touch = atomic_load_explicit(&g_last_touch_time, memory_order_relaxed);
+    bool touching = atomic_load_explicit(&g_touching, memory_order_relaxed);
+    int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);
+
+    if (touching || (now - last_touch < (uint64_t)slack)) {
+        int32_t active_rate = atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed);
+        if (atomic_load_explicit(&g_power_save_mode, memory_order_acquire) ||
+            atomic_load_explicit(&g_low_battery_mode, memory_order_acquire)) {
+            int32_t max_rate = atomic_load_explicit(&g_power_save_max_rate,
+                                                     memory_order_relaxed);
+            if (active_rate > max_rate) {
+                active_rate = max_rate;
+            }
+        }
+        setRefreshRate(active_rate);
+    } else {
+        setRefreshRate(atomic_load_explicit(&g_curr_idle_rate, memory_order_relaxed));
+    }
+}
+
+void updateCurrentAppRates(const char* pkg) {
+    int32_t new_idle, new_active;
+    bool found = false;
+
+    pthread_rwlock_rdlock(&g_config_lock);
+    uint32_t h = hash_string_fnv1a(pkg) & RULE_HASH_MASK;
+    for (int probe = 0; probe < RULE_HASH_SLOTS; probe++) {
+        int slot = (h + (uint32_t)probe) & RULE_HASH_MASK;
+        int idx = g_rule_hash[slot].index;
+        if (idx < 0) break; /* Empty slot — package has no rule. */
+        if (strcmp(g_rules[idx].pkg, pkg) == 0) {
+            new_idle   = (g_rules[idx].idle == -1)   ? g_default_idle_rate   : g_rules[idx].idle;
+            new_active = (g_rules[idx].active == -1) ? g_default_active_rate : g_rules[idx].active;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        new_idle   = g_default_idle_rate;
+        new_active = g_default_active_rate;
+    }
+    pthread_rwlock_unlock(&g_config_lock);
+
+    int32_t cur_idle   = atomic_load_explicit(&g_curr_idle_rate, memory_order_relaxed);
+    int32_t cur_active = atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed);
+
+    if (cur_idle == new_idle && cur_active == new_active) return;
+
+    atomic_store_explicit(&g_curr_idle_rate, new_idle, memory_order_relaxed);
+    atomic_store_explicit(&g_curr_active_rate, new_active, memory_order_relaxed);
+
+    if (found) {
+        LOGI("Focused package matches rule: '%s' -> idle: %d Hz, active: %d Hz",
+             pkg, new_idle, new_active);
+    } else {
+        LOGI("Focused package defaults (*): '%s' -> idle: %d Hz, active: %d Hz",
+             pkg, new_idle, new_active);
+    }
+    if (new_idle == new_active) {
+        LOGW("Note: Idle and active rates are equal (%d Hz). "
+             "Transitions will not occur within '%s'.", new_idle, pkg);
+    }
+
+    triggerPollerWakeup();
+}

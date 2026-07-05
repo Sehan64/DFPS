@@ -1,0 +1,171 @@
+# Build artifacts
+bin/
+build/
+*.o
+*.so
+*.a
+
+# Compiled binaries
+
+# Configuration files
+*.swp
+*.swo
+*.swpx
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python files (if any)
+*.pyc
+__pycache__/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs and debug files
+*.log
+
+# IDE and editor shortcuts
+*_build/
+*.vscode
+*.idea
+
+# System files
+system.properties
+
+# Package manager files (Termux)
+netrl*
+
+# Executables
+
+# Configuration monitoring results
+/data/local/tmp/dfps/
+dfps*
+!src/dfps.h
+
+# Compiled applications
+*.so*
+
+# Module dependencies
+*.dylib
+
+# Output directories
+*/build/
+*/output/
+
+# Temporary build files
+tmp/
+tmp_*
+
+# Conan package manager
+conanbuildinfo.txt
+conanbuildinfo.*
+conaninfo.txt
+conaninfo.*
+conanmanifest.txt
+conanmanifest.*
+*.con
+tmp_build/
+
+# Cargo build directory
+cargo-target/
+
+# Python virtual environments (if any)
+env/
+
+# Mobile build artifacts
+*.ipa
+*.apk
+*.aab
+
+# Ruby gems vendor/bundle
+vendor/bundle/
+vendor/ruby/
+
+# npm packages
+node_modules/
+npm-debug.log
+
+# Bundler
+.bundle/
+gemset.bucket
+
+# Maven build directory
+target/
+
+# Ant build directory
+build.xml
+build-output/
+
+# Gradle build directory
+gradle-wrapper.properties
+gradle-wrapper.jar
+gradle-wrapper/
+.gradle
+
+# Ivy build directory
+ivy.xml
+
+# SBT build directory
+lib/
+
+# Leining Maven build directory
+.lm/
+
+# Jenkins build artifacts
+*.jelly
+
+# Grit merge tool
+.gitmerge-rebase
+
+# Bazaar
+Bazaar/
+
+# CVS
+CVS/
+
+# Git
+.git/
+.git/HEAD
+.git/ORIG_HEAD
+.git/HEAD~1
+.git/HEAD~2
+.git/merge-
+.git/rebase-
+.git/sequencer
+.git/rewritten
+.git/rewrite-
+.git/am-
+.git/repaired
+.git rebase?
+.git/ !
+
+# Mercurial
+hgignore.txt
+hgsub
+
+# SVN
+svn.xml
+.svnignore
+.svn
+history.xml
+
+# TFS
+.tfs
+
+# Subversion
+*.svndumpfile
+
+# Mac OS X
+.DS_Store
+
+# Windows
+Thumbs.db
