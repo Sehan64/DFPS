@@ -157,7 +157,10 @@ void checkMinBrightness(void) {
     binder_status_t status_b = g_hot_ops.transact(
         g_hot_binders.displayManager,
         g_hot_ops.resolvedGetBrightnessCode, &in_b, &reply_b, 0);
-    if (status_b != STATUS_OK || !reply_b) return;
+    if (status_b != STATUS_OK || !reply_b) {
+        if (reply_b) g_hot_ops.deleteParcel(reply_b);
+        return;
+    }
 
     int32_t exception_b = -1;
     if (g_hot_ops.readInt32(reply_b, &exception_b) == STATUS_OK && exception_b == 0) {
@@ -227,10 +230,10 @@ void evaluateBatteryState(int32_t level) {
 /*  Netlink uevent handler                                             */
 /* ================================================================== */
 
-void handleUevent(void) {
+bool handleUevent(void) {
     char buf[8192];
     ssize_t len = recv(g_uevent_fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
-    if (len <= 0) return;
+    if (len <= 0) return false;
 
     buf[len] = '\0';
 
@@ -255,4 +258,5 @@ void handleUevent(void) {
     if (is_power_supply && new_level >= 0) {
         evaluateBatteryState(new_level);
     }
+    return true;
 }

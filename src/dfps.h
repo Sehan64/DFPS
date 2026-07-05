@@ -259,6 +259,7 @@ extern int32_t         g_min_physical_rate;
 
 /* Runtime tuning */
 extern _Atomic int32_t g_touch_slack_ms;
+extern _Atomic bool    g_enable_frame_rate_flex;
 extern _Atomic bool    g_enable_min_brightness;
 extern _Atomic int32_t g_min_brightness_threshold;
 extern _Atomic bool    g_debug;
@@ -398,6 +399,7 @@ void loadModesMap(void);
 void rebuildRuleHash(void);
 
 /* rate.c */
+void setSurfaceFlingerFrameRateFlex(bool enable);
 void setRefreshRate(int32_t rate);
 void updateRateState(void);
 void updateCurrentAppRates(const char* pkg);
@@ -436,7 +438,7 @@ int32_t readInitialBatteryLevel(void);
 void    checkInteractiveAndPowerSave(void);
 void    checkMinBrightness(void);
 void    evaluateBatteryState(int32_t level);
-void    handleUevent(void);
+bool    handleUevent(void);
 
 /* touch.c */
 void  findTouchscreens(void);

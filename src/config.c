@@ -130,6 +130,7 @@ void loadConfig(void) {
     int32_t temp_default_idle = 60;
     int32_t temp_default_active = 120;
     int32_t temp_slack = 4000;
+    bool temp_frame_rate_flex = false;
     bool temp_min_bright = false;
     int32_t temp_min_bright_threshold = 0;
     bool temp_debug = false;
@@ -167,6 +168,9 @@ void loadConfig(void) {
                 temp_debug = true;
         } else if (strcasecmp(key, "touchSlackMs") == 0) {
             char *ep; temp_slack = (int32_t)strtol(val, &ep, 10);
+        } else if (strcasecmp(key, "enableFrameRateFlex") == 0) {
+            if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                temp_frame_rate_flex = true;
         } else if (strcasecmp(key, "enableMinBrightness") == 0) {
             if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
                 temp_min_bright = true;
@@ -247,6 +251,11 @@ void loadConfig(void) {
     }
 
     atomic_store(&g_debug, temp_debug);
+    bool old_frame_rate_flex = atomic_exchange_explicit(
+        &g_enable_frame_rate_flex, temp_frame_rate_flex, memory_order_acq_rel);
+    if (old_frame_rate_flex != temp_frame_rate_flex && g_hot_binders.surfaceFlinger) {
+        setSurfaceFlingerFrameRateFlex(temp_frame_rate_flex);
+    }
 
     /* Commit parsed config under write lock */
     pthread_rwlock_wrlock(&g_config_lock);
@@ -268,8 +277,10 @@ void loadConfig(void) {
     atomic_store_explicit(&g_power_save_max_rate, temp_power_save_max_rate, memory_order_release);
 
     LOGI("Parsed dfps.conf successfully. Rules loaded: %d rules", g_rule_count);
-    LOGI("Params: slack=%d ms, min_bright=%d, min_bright_thresh=%d%%, debug=%d",
-         temp_slack, temp_min_bright, temp_min_bright_threshold, temp_debug);
+    LOGI("Params: slack=%d ms, frame_rate_flex=%d, min_bright=%d, "
+         "min_bright_thresh=%d%%, debug=%d",
+         temp_slack, temp_frame_rate_flex, temp_min_bright,
+         temp_min_bright_threshold, temp_debug);
     LOGI("Fallback behavior: Idle: %d Hz | Active: %d Hz",
          temp_default_idle, temp_default_active);
     LOGI("Offscreen behavior: %d Hz", temp_offscreen_rate);

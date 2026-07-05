@@ -8,6 +8,8 @@
 
 #include "dfps.h"
 
+static bool s_touch_tracking_fallback[MAX_TOUCH_DEVICES];
+
 /* ================================================================== */
 /*  Touch device discovery                                             */
 /* ================================================================== */
@@ -39,6 +41,7 @@ void findTouchscreens(void) {
                     (1UL << (EV_KEY % (sizeof(unsigned long) * 8))));
 
                 bool is_touch = false;
+                bool has_btn_touch = false;
                 if (has_abs) {
                     ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits);
                     bool has_mt_x = (abs_bits[ABS_MT_POSITION_X / (sizeof(unsigned long) * 8)] &
@@ -47,12 +50,17 @@ void findTouchscreens(void) {
                 }
                 if (!is_touch && has_key) {
                     ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
-                    bool has_btn_touch = (key_bits[BTN_TOUCH / (sizeof(unsigned long) * 8)] &
+                    has_btn_touch = (key_bits[BTN_TOUCH / (sizeof(unsigned long) * 8)] &
                         (1UL << (BTN_TOUCH % (sizeof(unsigned long) * 8))));
                     if (has_btn_touch) is_touch = true;
+                } else if (has_key) {
+                    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
+                    has_btn_touch = (key_bits[BTN_TOUCH / (sizeof(unsigned long) * 8)] &
+                        (1UL << (BTN_TOUCH % (sizeof(unsigned long) * 8))));
                 }
 
                 if (is_touch && g_touch_fd_count < MAX_TOUCH_DEVICES) {
+                    s_touch_tracking_fallback[g_touch_fd_count] = !has_btn_touch;
                     g_touch_fds[g_touch_fd_count++] = fd;
                     LOGI("  - Registered input device: %s", path);
                 } else {
@@ -127,6 +135,25 @@ static void handleInotifyEvents(void) {
 /* ================================================================== */
 /*  Main event loop                                                    */
 /* ================================================================== */
+
+static inline void updateTouchStateFromEvent(const struct input_event* ev,
+                                             bool use_tracking_fallback,
+                                             bool* saw_state,
+                                             bool* final_touching) {
+    if (ev->type == EV_KEY && ev->code == BTN_TOUCH) {
+        if (ev->value == 0 || ev->value == 1) {
+            *saw_state = true;
+            *final_touching = (ev->value == 1);
+        }
+        return;
+    }
+
+    if (use_tracking_fallback &&
+        ev->type == EV_ABS && ev->code == ABS_MT_TRACKING_ID) {
+        *saw_state = true;
+        *final_touching = (ev->value >= 0);
+    }
+}
 
 void* touchListenerThread(void* arg) {
     (void)arg;
@@ -245,8 +272,16 @@ void* touchListenerThread(void* arg) {
 
             if (kind == FD_TOUCH) {
                 if (revents & EPOLLIN) {
-                    bool touch_down_detected = false;
-                    bool touch_up_detected = false;
+                    bool saw_touch_state = false;
+                    bool final_touching = atomic_load_explicit(&g_touching,
+                                                               memory_order_relaxed);
+                    bool use_tracking_fallback = false;
+                    for (int t = 0; t < g_touch_fd_count; t++) {
+                        if (g_touch_fds[t] == fd) {
+                            use_tracking_fallback = s_touch_tracking_fallback[t];
+                            break;
+                        }
+                    }
 
                     while (true) {
                         ssize_t n = read(fd, evs, sizeof(evs));
@@ -256,26 +291,15 @@ void* touchListenerThread(void* arg) {
                         }
                         size_t count = n / sizeof(struct input_event);
                         for (size_t k = 0; k < count; k++) {
-                            struct input_event* ev = &evs[k];
-                            if (ev->type == EV_KEY && ev->code == BTN_TOUCH) {
-                                if (ev->value == 1) {
-                                    touch_down_detected = true;
-                                } else if (ev->value == 0) {
-                                    touch_up_detected = true;
-                                }
-                            }
+                            updateTouchStateFromEvent(&evs[k], use_tracking_fallback,
+                                                      &saw_touch_state,
+                                                      &final_touching);
                         }
                     }
 
-                    /* If both down and up appeared in the same batch, treat it
-                     * as a tap and keep the active window open via last_touch_time. */
-                    if (touch_down_detected) {
-                        atomic_store_explicit(&g_touching, true, memory_order_relaxed);
-                        atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
-                        needs_rate_update = true;
-                    }
-                    if (touch_up_detected) {
-                        atomic_store_explicit(&g_touching, false, memory_order_relaxed);
+                    if (saw_touch_state) {
+                        atomic_store_explicit(&g_touching, final_touching,
+                                              memory_order_relaxed);
                         atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
                         needs_rate_update = true;
                     }
@@ -312,7 +336,8 @@ void* touchListenerThread(void* arg) {
 
             if (kind == FD_UEVENT) {
                 if (revents & EPOLLIN) {
-                    handleUevent();
+                    while (handleUevent()) {
+                    }
                     needs_rate_update = true;
                 }
                 continue;
@@ -320,9 +345,18 @@ void* touchListenerThread(void* arg) {
 
             if (kind == FD_SERVER) {
                 if (revents & EPOLLIN) {
-                    int client_fd = accept4(fd, NULL, NULL,
-                                             SOCK_NONBLOCK | SOCK_CLOEXEC);
-                    if (client_fd >= 0) {
+                    while (true) {
+                        int client_fd = accept4(fd, NULL, NULL,
+                                                SOCK_NONBLOCK | SOCK_CLOEXEC);
+                        if (client_fd < 0) {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                                errno != EINTR) {
+                                LOGE("accept4 failed on @dfps: %s", strerror(errno));
+                            }
+                            if (errno == EINTR) continue;
+                            break;
+                        }
+
                         pthread_spin_lock(&g_client_lock);
                         if (g_client_count < MAX_CLIENTS) {
                             struct epoll_event c_ev;

@@ -81,6 +81,33 @@ static void setSfActiveConfigDirect(int32_t id) {
 /*  Public interface                                                   */
 /* ================================================================== */
 
+void setSurfaceFlingerFrameRateFlex(bool enable) {
+    if (!g_hot_binders.surfaceFlinger) {
+        LOGE("SurfaceFlinger binder missing in hot context.");
+        return;
+    }
+
+    AParcel* in = NULL;
+    if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) != STATUS_OK || !in) {
+        LOGE("Failed preparing SurfaceFlinger transaction 1036.");
+        return;
+    }
+
+    g_hot_ops.writeInt32(in, enable ? 1 : 0);
+    AParcel* reply = NULL;
+    binder_status_t status = g_hot_ops.transact(
+        g_hot_binders.surfaceFlinger, 1036, &in, &reply, 0);
+    if (reply) g_hot_ops.deleteParcel(reply);
+
+    if (status == STATUS_OK) {
+        LOGI("SurfaceFlinger frame-rate flexibility %s via transaction 1036.",
+             enable ? "enabled" : "disabled");
+    } else {
+        LOGW("SurfaceFlinger transaction 1036 failed: status %d. "
+             "Continuing with direct mode changes only.", status);
+    }
+}
+
 void setRefreshRate(int32_t rate) {
     if (rate <= 0) return;
 

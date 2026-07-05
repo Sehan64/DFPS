@@ -28,6 +28,7 @@ int32_t           g_min_physical_rate = 0;
 
 /* Runtime tuning */
 _Atomic int32_t   g_touch_slack_ms = 4000;
+_Atomic bool      g_enable_frame_rate_flex = false;
 _Atomic bool      g_enable_min_brightness = false;
 _Atomic int32_t   g_min_brightness_threshold = 0;
 _Atomic bool      g_debug = false;

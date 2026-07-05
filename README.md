@@ -175,6 +175,8 @@ The default `dfps.conf` written by `customize.sh` on first install:
 - **Touch slack:** 2000 ms — the screen stays at the active rate for 2 s
   after the last touch event.
 - **Brightness clamp:** *off* (set the threshold in the WebUI to enable).
+- **Frame-rate flexibility:** *off* (optional SurfaceFlinger policy override
+  for devices that block cross-group switching).
 - **Battery saver:** *off* (will engage automatically when the system
   reports it; cap configurable).
 - **Low battery:** threshold 10 %, max rate 60 Hz when below it.
@@ -215,6 +217,7 @@ Quick reference:
 |---|---|---|---|
 | `DEBUG` | bool | `false` | Verbose logging. |
 | `touchSlackMs` | int | `2000` | Hold active rate this long after the last touch. |
+| `enableFrameRateFlex` | bool | `false` | Enable SurfaceFlinger transaction `1036` to allow cross-group refresh switching. |
 | `enableMinBrightness` | bool | `false` | Clamp to min rate when dim. |
 | `minBrightnessThreshold` | 0–100 | `0` | Brightness % to trigger the clamp. |
 | `batterySaver` | bool | `false` | Honor the system's power-save mode. |
