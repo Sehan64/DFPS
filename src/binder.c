@@ -443,6 +443,69 @@ static int resolveAllFields(const char* jar_path,
 }
 
 __attribute__((cold))
+static bool writeTransactionCache(const char* cache_path,
+                                 const char* current_fp,
+                                 transaction_code_t observer,
+                                 transaction_code_t rootTask,
+                                 transaction_code_t stackTask,
+                                 transaction_code_t fg,
+                                 transaction_code_t is_interactive,
+                                 transaction_code_t is_power_save,
+                                 transaction_code_t get_brightness,
+                                 transaction_code_t on_display_event,
+                                 transaction_code_t register_cb_mask,
+                                 transaction_code_t register_cb,
+                                 transaction_code_t register_batt_listener,
+                                 transaction_code_t batt_changed) {
+    char tmp_cache_path[256];
+    snprintf(tmp_cache_path, sizeof(tmp_cache_path),
+             "%s.%ld.tmp", cache_path, (long)getpid());
+    int out_cache_fd = open(tmp_cache_path,
+                            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                            0600);
+    FILE* out_cache_f = out_cache_fd >= 0 ? fdopen(out_cache_fd, "w") : NULL;
+    if (!out_cache_f) {
+        if (out_cache_fd >= 0) close(out_cache_fd);
+        return false;
+    }
+
+    int ok = 1;
+    ok = ok && fprintf(out_cache_f, "v=1\n") > 0;
+    ok = ok && fprintf(out_cache_f, "fingerprint=%s\n", current_fp) > 0;
+    if (observer) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerProcessObserver=%u\n", observer) > 0;
+    if (rootTask) ok = ok && fprintf(out_cache_f, "TRANSACTION_getFocusedRootTaskInfo=%u\n", rootTask) > 0;
+    if (stackTask) ok = ok && fprintf(out_cache_f, "TRANSACTION_getFocusedStackInfo=%u\n", stackTask) > 0;
+    if (fg) ok = ok && fprintf(out_cache_f, "TRANSACTION_onForegroundActivitiesChanged=%u\n", fg) > 0;
+    if (is_interactive) ok = ok && fprintf(out_cache_f, "TRANSACTION_isInteractive=%u\n", is_interactive) > 0;
+    if (is_power_save) ok = ok && fprintf(out_cache_f, "TRANSACTION_isPowerSaveMode=%u\n", is_power_save) > 0;
+    if (get_brightness) ok = ok && fprintf(out_cache_f, "TRANSACTION_getBrightness=%u\n", get_brightness) > 0;
+    if (on_display_event) ok = ok && fprintf(out_cache_f, "TRANSACTION_onDisplayEvent=%u\n", on_display_event) > 0;
+    if (register_cb_mask) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerCallbackWithEventMask=%u\n", register_cb_mask) > 0;
+    if (register_cb) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerCallback=%u\n", register_cb) > 0;
+    if (register_batt_listener) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerListener=%u\n", register_batt_listener) > 0;
+    if (batt_changed) ok = ok && fprintf(out_cache_f, "TRANSACTION_batteryPropertiesChanged=%u\n", batt_changed) > 0;
+    if (fflush(out_cache_f) != 0) ok = 0;
+    if (ok && fsync(fileno(out_cache_f)) != 0) ok = 0;
+    if (fclose(out_cache_f) != 0) ok = 0;
+    if (!ok) {
+        unlink(tmp_cache_path);
+        return false;
+    }
+
+    if (rename(tmp_cache_path, cache_path) != 0) {
+        unlink(tmp_cache_path);
+        return false;
+    }
+
+    int dir_fd = open("/data/local/tmp/dfps", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+        (void)fsync(dir_fd);
+        close(dir_fd);
+    }
+    return true;
+}
+
+__attribute__((cold))
 void resolveTransactionCodes(void) {
     const char* cache_path = "/data/local/tmp/dfps/tx_code.txt";
 
@@ -463,6 +526,8 @@ void resolveTransactionCodes(void) {
         char line[256];
         int version = 0;
         char cached_fp[256] = {0};
+        bool saw_register_batt_listener_zero = false;
+        bool saw_batt_changed_zero = false;
         transaction_code_t observer = 0, rootTask = 0, stackTask = 0, fg = 0;
         transaction_code_t is_interactive = 0, is_power_save = 0, get_brightness = 0;
         transaction_code_t on_display_event = 0, register_cb_mask = 0, register_cb = 0;
@@ -487,9 +552,14 @@ void resolveTransactionCodes(void) {
                     else if (strcmp(key, "TRANSACTION_getBrightness") == 0) get_brightness = val;
                     else if (strcmp(key, "TRANSACTION_onDisplayEvent") == 0) on_display_event = val;
                     else if (strcmp(key, "TRANSACTION_registerCallbackWithEventMask") == 0) register_cb_mask = val;
-                    else if (strcmp(key, "TRANSACTION_registerCallback") == 0) register_cb = val;
-                    else if (strcmp(key, "TRANSACTION_registerListener") == 0) register_batt_listener = val;
-                    else if (strcmp(key, "TRANSACTION_batteryPropertiesChanged") == 0) batt_changed = val;
+                else if (strcmp(key, "TRANSACTION_registerCallback") == 0) register_cb = val;
+                    else if (strcmp(key, "TRANSACTION_registerListener") == 0) {
+                        register_batt_listener = val;
+                        saw_register_batt_listener_zero = (val == 0);
+                    } else if (strcmp(key, "TRANSACTION_batteryPropertiesChanged") == 0) {
+                        batt_changed = val;
+                        saw_batt_changed_zero = (val == 0);
+                    }
                 }
             }
         }
@@ -515,6 +585,16 @@ void resolveTransactionCodes(void) {
             g_hot_ops.resolvedRegisterCallbackCode = register_cb;
             g_hot_ops.resolvedRegisterBatteryListenerCode = register_batt_listener;
             g_hot_ops.resolvedBatteryChangedCode = batt_changed;
+            if (saw_register_batt_listener_zero || saw_batt_changed_zero) {
+                if (!writeTransactionCache(cache_path, current_fp, observer, rootTask,
+                                           stackTask, fg, is_interactive, is_power_save,
+                                           get_brightness, on_display_event,
+                                           register_cb_mask, register_cb,
+                                           register_batt_listener, batt_changed)) {
+                    LOGW("Transaction code cache cleanup failed; zero-valued battery listener "
+                         "entries may remain until the next regeneration.");
+                }
+            }
             return;
         }
         LOGW("Transaction code cache invalid or outdated. Regenerating...");
@@ -582,52 +662,13 @@ void resolveTransactionCodes(void) {
         g_hot_ops.resolvedRegisterBatteryListenerCode = register_batt_listener;
         g_hot_ops.resolvedBatteryChangedCode = batt_changed;
 
-        /* Write cache for next startup atomically (temp file + rename). */
-        char tmp_cache_path[256];
-        snprintf(tmp_cache_path, sizeof(tmp_cache_path),
-                 "%s.%ld.tmp", cache_path, (long)getpid());
-        int out_cache_fd = open(tmp_cache_path,
-                                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                                0600);
-        FILE* out_cache_f = out_cache_fd >= 0 ? fdopen(out_cache_fd, "w") : NULL;
-        if (out_cache_f) {
-            int ok = 1;
-            ok = ok && fprintf(out_cache_f, "v=1\n") > 0;
-            ok = ok && fprintf(out_cache_f, "fingerprint=%s\n", current_fp) > 0;
-            if (observer) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerProcessObserver=%u\n", observer) > 0;
-            if (rootTask) ok = ok && fprintf(out_cache_f, "TRANSACTION_getFocusedRootTaskInfo=%u\n", rootTask) > 0;
-            if (stackTask) ok = ok && fprintf(out_cache_f, "TRANSACTION_getFocusedStackInfo=%u\n", stackTask) > 0;
-            if (fg) ok = ok && fprintf(out_cache_f, "TRANSACTION_onForegroundActivitiesChanged=%u\n", fg) > 0;
-            if (is_interactive) ok = ok && fprintf(out_cache_f, "TRANSACTION_isInteractive=%u\n", is_interactive) > 0;
-            if (is_power_save) ok = ok && fprintf(out_cache_f, "TRANSACTION_isPowerSaveMode=%u\n", is_power_save) > 0;
-            if (get_brightness) ok = ok && fprintf(out_cache_f, "TRANSACTION_getBrightness=%u\n", get_brightness) > 0;
-            if (on_display_event) ok = ok && fprintf(out_cache_f, "TRANSACTION_onDisplayEvent=%u\n", on_display_event) > 0;
-            if (register_cb_mask) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerCallbackWithEventMask=%u\n", register_cb_mask) > 0;
-            if (register_cb) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerCallback=%u\n", register_cb) > 0;
-            if (register_batt_listener) ok = ok && fprintf(out_cache_f, "TRANSACTION_registerListener=%u\n", register_batt_listener) > 0;
-            if (batt_changed) ok = ok && fprintf(out_cache_f, "TRANSACTION_batteryPropertiesChanged=%u\n", batt_changed) > 0;
-            if (fflush(out_cache_f) != 0) ok = 0;
-            if (ok && fsync(fileno(out_cache_f)) != 0) ok = 0;
-            if (fclose(out_cache_f) != 0) ok = 0;
-            if (ok) {
-                if (rename(tmp_cache_path, cache_path) != 0) {
-                    LOGW("Transaction code cache rename failed: %s", strerror(errno));
-                    unlink(tmp_cache_path);
-                } else {
-                    int dir_fd = open("/data/local/tmp/dfps",
-                                      O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-                    if (dir_fd >= 0) {
-                        (void)fsync(dir_fd);
-                        close(dir_fd);
-                    }
-                }
-            } else {
-                LOGW("Transaction code cache write failed (disk full or I/O error). "
-                     "Codes will be re-resolved on next startup.");
-                unlink(tmp_cache_path);
-            }
-        } else if (out_cache_fd >= 0) {
-            close(out_cache_fd);
+        if (!writeTransactionCache(cache_path, current_fp, observer, rootTask,
+                                   stackTask, fg, is_interactive, is_power_save,
+                                   get_brightness, on_display_event,
+                                   register_cb_mask, register_cb,
+                                   register_batt_listener, batt_changed)) {
+            LOGW("Transaction code cache write failed (disk full or I/O error). "
+                 "Codes will be re-resolved on next startup.");
         }
     } else {
         LOGE("Failed to resolve transaction codes via app_process.");
