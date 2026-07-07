@@ -34,7 +34,8 @@ Quick start:
 ```bash
 make
 make install
-su -c /data/local/tmp/dfps/bin/dfps
+su # or adb shell
+/data/local/tmp/dfps/dfps
 ```
 
 ## Configuration
