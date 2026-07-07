@@ -1,14 +1,10 @@
 # Architecture
 
-DFPS is an event-driven daemon with two execution paths:
+DFPS is an event-driven daemon with Binder callbacks on worker threads and all
+I/O on one epoll thread.
 
-- Binder workers handle system callbacks.
-- One epoll thread handles touch input, inotify reloads, uevents, and socket
-  clients.
-
-The main process bootstraps the daemon, starts the Binder thread pool with
-`ABinderProcess_startThreadPool()`, and then waits for shutdown. The touch
-thread owns the long-lived I/O loop.
+`main()` bootstraps the daemon, starts the Binder pool with
+`ABinderProcess_startThreadPool()`, and then waits for shutdown.
 
 ## Startup
 

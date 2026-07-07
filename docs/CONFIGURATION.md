@@ -5,8 +5,8 @@ DFPS reads two runtime files from `/data/local/tmp/dfps/`:
 - `dfps.conf`
 - `modes.map`
 
-Both are hot-reloaded with inotify. If a file is missing, DFPS now falls back
-to defaults instead of keeping stale state.
+Both are hot-reloaded with inotify. Missing files reset to defaults instead of
+leaving stale state behind.
 
 ## `dfps.conf`
 

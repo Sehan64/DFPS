@@ -1,6 +1,6 @@
 # Installation
 
-`dfps.zip` is one archive that installs on Magisk, KernelSU, and Axeron.
+`dfps.zip` is a single archive for Magisk, KernelSU, and Axeron.
 
 ## Requirements
 

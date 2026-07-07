@@ -1,8 +1,8 @@
 # DFPS
 
-DFPS is a small Android daemon that switches display refresh rate based on
-touch, foreground app, brightness, and battery state. It runs as a root module
-for Magisk, KernelSU, and Axeron, and exposes a simple `@dfps` socket for
+DFPS is a small Android daemon that switches display refresh rate from touch,
+foreground app, brightness, and battery state. It ships as a root module for
+Magisk, KernelSU, and Axeron, and exposes a simple `@dfps` socket for
 foreground-package snapshots.
 
 ## What it does
@@ -16,10 +16,9 @@ foreground-package snapshots.
 
 ## Runtime model
 
-- The daemon uses Binder for ActivityManager, PowerManager, SurfaceFlinger,
-  DisplayManager, and battery state.
-- A dedicated epoll thread handles touch input, inotify reloads, sockets, and
-  uevents.
+- Binder handles ActivityManager, PowerManager, SurfaceFlinger, DisplayManager,
+  and battery state.
+- One epoll thread handles touch input, inotify reloads, sockets, and uevents.
 - The main process starts the Binder thread pool and exits cleanly on
   `SIGTERM` / `SIGINT`.
 - `@dfps` is a singleton abstract socket. A second instance fails startup.
