@@ -6,17 +6,27 @@
 
 #include "dfps.h"
 
+/* Allow tests to override the runtime file locations without changing the
+ * production defaults. */
+#ifndef DFPS_CONFIG_PATH
+#define DFPS_CONFIG_PATH "/data/local/tmp/dfps/dfps.conf"
+#endif
+
+#ifndef DFPS_MODES_MAP_PATH
+#define DFPS_MODES_MAP_PATH "/data/local/tmp/dfps/modes.map"
+#endif
+
 /* ================================================================== */
 /*  SurfaceFlinger mode map                                            */
 /* ================================================================== */
 
 __attribute__((cold))
 void loadModesMap(void) {
-    const char* map_path = "/data/local/tmp/dfps/modes.map";
+    const char* map_path = DFPS_MODES_MAP_PATH;
     FILE* f = fopen(map_path, "r");
     if (!f) {
-        LOGW("modes.map could not be loaded from %s.", map_path);
-        return;
+        LOGE("modes.map missing at %s; clearing cached mode map to defaults.",
+             map_path);
     }
 
     ModeMapEntry temp_modes[MAX_MODES];
@@ -24,53 +34,56 @@ void loadModesMap(void) {
     int32_t temp_max_rate = 0, temp_min_rate = 0;
     char line[256];
     int line_num = 0;
-    while (fgets(line, sizeof(line), f)) {
-        line_num++;
-        char* hash = strchr(line, '#');
-        if (hash) *hash = '\0';
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            line_num++;
+            char* hash = strchr(line, '#');
+            if (hash) *hash = '\0';
 
-        char* p = line;
-        while (isspace((unsigned char)*p)) p++;
-        if (*p == '\0') continue;
+            char* p = line;
+            while (isspace((unsigned char)*p)) p++;
+            if (*p == '\0') continue;
 
-        char* end = NULL;
-        long parsed_rate = strtol(p, &end, 10);
-        if (end == p) {
-            LOGW("modes.map line %d: ignored malformed line", line_num);
-            continue;
-        }
+            char* end = NULL;
+            long parsed_rate = strtol(p, &end, 10);
+            if (end == p) {
+                LOGW("modes.map line %d: ignored malformed line", line_num);
+                continue;
+            }
 
-        p = end;
-        while (isspace((unsigned char)*p)) p++;
-        long parsed_id = strtol(p, &end, 10);
-        if (end == p) {
-            LOGW("modes.map line %d: ignored malformed line", line_num);
-            continue;
-        }
+            p = end;
+            while (isspace((unsigned char)*p)) p++;
+            long parsed_id = strtol(p, &end, 10);
+            if (end == p) {
+                LOGW("modes.map line %d: ignored malformed line", line_num);
+                continue;
+            }
 
-        int32_t rate = (int32_t)parsed_rate;
-        int32_t id = (int32_t)parsed_id;
-        if (rate <= 0 || rate > 1000) {
-            LOGW("modes.map line %d: rejected absurd rate %d", line_num, rate);
-            continue;
+            int32_t rate = (int32_t)parsed_rate;
+            int32_t id = (int32_t)parsed_id;
+            if (rate <= 0 || rate > 1000) {
+                LOGW("modes.map line %d: rejected absurd rate %d", line_num, rate);
+                continue;
+            }
+            if (id < 0) {
+                LOGW("modes.map line %d: rejected negative id %d", line_num, id);
+                continue;
+            }
+            if (temp_mode_count < MAX_MODES) {
+                temp_modes[temp_mode_count].rate = rate;
+                temp_modes[temp_mode_count].id = id;
+                if (rate > temp_max_rate) temp_max_rate = rate;
+                if (temp_min_rate == 0 || rate < temp_min_rate) temp_min_rate = rate;
+                temp_mode_count++;
+            }
         }
-        if (id < 0) {
-            LOGW("modes.map line %d: rejected negative id %d", line_num, id);
-            continue;
-        }
-        if (temp_mode_count < MAX_MODES) {
-            temp_modes[temp_mode_count].rate = rate;
-            temp_modes[temp_mode_count].id = id;
-            if (rate > temp_max_rate) temp_max_rate = rate;
-            if (temp_min_rate == 0 || rate < temp_min_rate) temp_min_rate = rate;
-            temp_mode_count++;
-        }
+        fclose(f);
     }
-    fclose(f);
 
     /* Commit under write lock — consistent with loadConfig */
     pthread_rwlock_wrlock(&g_config_lock);
     g_mode_count = temp_mode_count;
+    memset(g_modes, 0, sizeof(g_modes));
     if (temp_mode_count > 0) {
         memcpy(g_modes, temp_modes, sizeof(ModeMapEntry) * temp_mode_count);
     }
@@ -118,11 +131,11 @@ void rebuildRuleHash(void) {
 
 __attribute__((cold))
 void loadConfig(void) {
-    const char* config_path = "/data/local/tmp/dfps/dfps.conf";
+    const char* config_path = DFPS_CONFIG_PATH;
     FILE* f = fopen(config_path, "r");
     if (!f) {
-        LOGE("Configuration file could not be located at %s!", config_path);
-        return;
+        LOGE("Configuration file missing at %s; reverting to defaults.",
+             config_path);
     }
 
     PerAppRule temp_rules[MAX_RULES];
@@ -142,82 +155,84 @@ void loadConfig(void) {
 
     char line[256];
     int line_num = 0;
-    while (fgets(line, sizeof(line), f)) {
-        line_num++;
-        char* hash = strchr(line, '#');
-        if (hash) *hash = '\0';
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            line_num++;
+            char* hash = strchr(line, '#');
+            if (hash) *hash = '\0';
 
-        int len = strlen(line);
-        while (len > 0 && isspace((unsigned char)line[len-1])) {
-            line[--len] = '\0';
-        }
-        if (len == 0) continue;
+            int len = strlen(line);
+            while (len > 0 && isspace((unsigned char)line[len-1])) {
+                line[--len] = '\0';
+            }
+            if (len == 0) continue;
 
-        char* eq = strchr(line, '=');
-        if (!eq) continue;
+            char* eq = strchr(line, '=');
+            if (!eq) continue;
 
-        *eq = '\0';
-        char* key = line;
-        char* val = eq + 1;
+            *eq = '\0';
+            char* key = line;
+            char* val = eq + 1;
 
-        while (isspace((unsigned char)*key)) key++;
-        if (*key == '\0') continue;
-        char* key_end = key + strlen(key) - 1;
-        while (key_end > key && isspace((unsigned char)*key_end)) *key_end-- = '\0';
-        while (isspace((unsigned char)*val)) val++;
+            while (isspace((unsigned char)*key)) key++;
+            if (*key == '\0') continue;
+            char* key_end = key + strlen(key) - 1;
+            while (key_end > key && isspace((unsigned char)*key_end)) *key_end-- = '\0';
+            while (isspace((unsigned char)*val)) val++;
 
-        if (strcasecmp(key, "DEBUG") == 0) {
-            if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                temp_debug = true;
-        } else if (strcasecmp(key, "touchSlackMs") == 0) {
-            char *ep; temp_slack = (int32_t)strtol(val, &ep, 10);
-        } else if (strcasecmp(key, "enableFrameRateFlex") == 0) {
-            if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                temp_frame_rate_flex = true;
-        } else if (strcasecmp(key, "enableMinBrightness") == 0) {
-            if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                temp_min_bright = true;
-        } else if (strcasecmp(key, "minBrightnessThreshold") == 0) {
-            char *ep; temp_min_bright_threshold = (int32_t)strtol(val, &ep, 10);
-        } else if (strcasecmp(key, "defaultIdle") == 0) {
-            char *ep; temp_default_idle = (int32_t)strtol(val, &ep, 10);
-        } else if (strcasecmp(key, "defaultActive") == 0) {
-            char *ep; temp_default_active = (int32_t)strtol(val, &ep, 10);
-        } else if (strcasecmp(key, "offscreenRate") == 0) {
-            char *ep; temp_offscreen_rate = (int32_t)strtol(val, &ep, 10);
-        } else if (strcasecmp(key, "batterySaver") == 0) {
-            if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                temp_battery_saver = true;
-        } else if (strcasecmp(key, "lowBatteryThreshold") == 0) {
-            char *ep; temp_low_battery_threshold = (int32_t)strtol(val, &ep, 10);
-        } else if (strcasecmp(key, "powerSaveMaxRate") == 0) {
-            char *ep; temp_power_save_max_rate = (int32_t)strtol(val, &ep, 10);
-        } else {
-            /* Per-app rule: "PackageName = idle active" */
-            int idle = -1, active = -1;
-            if (sscanf(val, "%d %d", &idle, &active) == 2) {
-                bool valid = true;
-                if (idle != -1 && (idle <= 0 || idle > 1000)) {
-                    LOGW("dfps.conf line %d: rejected absurd idle rate %d for '%s'",
-                         line_num, idle, key);
-                    valid = false;
-                }
-                if (active != -1 && (active <= 0 || active > 1000)) {
-                    LOGW("dfps.conf line %d: rejected absurd active rate %d for '%s'",
-                         line_num, active, key);
-                    valid = false;
-                }
-                if (valid && temp_rule_count < MAX_RULES) {
-                    strlcpy(temp_rules[temp_rule_count].pkg, key,
-                            sizeof(temp_rules[0].pkg));
-                    temp_rules[temp_rule_count].idle = idle;
-                    temp_rules[temp_rule_count].active = active;
-                    temp_rule_count++;
+            if (strcasecmp(key, "DEBUG") == 0) {
+                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                    temp_debug = true;
+            } else if (strcasecmp(key, "touchSlackMs") == 0) {
+                char *ep; temp_slack = (int32_t)strtol(val, &ep, 10);
+            } else if (strcasecmp(key, "enableFrameRateFlex") == 0) {
+                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                    temp_frame_rate_flex = true;
+            } else if (strcasecmp(key, "enableMinBrightness") == 0) {
+                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                    temp_min_bright = true;
+            } else if (strcasecmp(key, "minBrightnessThreshold") == 0) {
+                char *ep; temp_min_bright_threshold = (int32_t)strtol(val, &ep, 10);
+            } else if (strcasecmp(key, "defaultIdle") == 0) {
+                char *ep; temp_default_idle = (int32_t)strtol(val, &ep, 10);
+            } else if (strcasecmp(key, "defaultActive") == 0) {
+                char *ep; temp_default_active = (int32_t)strtol(val, &ep, 10);
+            } else if (strcasecmp(key, "offscreenRate") == 0) {
+                char *ep; temp_offscreen_rate = (int32_t)strtol(val, &ep, 10);
+            } else if (strcasecmp(key, "batterySaver") == 0) {
+                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                    temp_battery_saver = true;
+            } else if (strcasecmp(key, "lowBatteryThreshold") == 0) {
+                char *ep; temp_low_battery_threshold = (int32_t)strtol(val, &ep, 10);
+            } else if (strcasecmp(key, "powerSaveMaxRate") == 0) {
+                char *ep; temp_power_save_max_rate = (int32_t)strtol(val, &ep, 10);
+            } else {
+                /* Per-app rule: "PackageName = idle active" */
+                int idle = -1, active = -1;
+                if (sscanf(val, "%d %d", &idle, &active) == 2) {
+                    bool valid = true;
+                    if (idle != -1 && (idle <= 0 || idle > 1000)) {
+                        LOGW("dfps.conf line %d: rejected absurd idle rate %d for '%s'",
+                             line_num, idle, key);
+                        valid = false;
+                    }
+                    if (active != -1 && (active <= 0 || active > 1000)) {
+                        LOGW("dfps.conf line %d: rejected absurd active rate %d for '%s'",
+                             line_num, active, key);
+                        valid = false;
+                    }
+                    if (valid && temp_rule_count < MAX_RULES) {
+                        strlcpy(temp_rules[temp_rule_count].pkg, key,
+                                sizeof(temp_rules[0].pkg));
+                        temp_rules[temp_rule_count].idle = idle;
+                        temp_rules[temp_rule_count].active = active;
+                        temp_rule_count++;
+                    }
                 }
             }
         }
+        fclose(f);
     }
-    fclose(f);
 
     /* Validate accumulated values */
     if (temp_slack < 0 || temp_slack > 60000) {

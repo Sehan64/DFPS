@@ -91,6 +91,7 @@ typedef binder_status_t    (*readFloat_t)(const AParcel*, float*);
 typedef binder_status_t    (*readString_t)(const AParcel*, void*, AParcel_stringAllocator);
 typedef void               (*deleteParcel_t)(AParcel*);
 typedef void               (*setThreadPoolMaxThreadCount_t)(uint32_t);
+typedef void               (*startThreadPool_t)(void);
 typedef void               (*joinThreadPool_t)(void);
 
 typedef void    (*AIBinder_DeathRecipient_onBinderDied)(void* cookie);
@@ -163,6 +164,7 @@ typedef struct {
     new_t                  AIBinder_new;
     associateClass_t       associateClass;
     setThreadPoolMaxThreadCount_t setThreadPoolMaxThreadCount;
+    startThreadPool_t      startThreadPool;
     joinThreadPool_t       joinThreadPool;
     writeStrongBinder_t    writeString;
     AIBinder_DeathRecipient_new_t DeathRecipient_new;
@@ -388,7 +390,7 @@ static inline int get_fd(void* ptr) {
 
 /* utils.c */
 void initLogging(void);
-void setupAbstractSocket(void);
+bool setupAbstractSocket(void);
 char** buildResolverEnv(const char* jar_path);
 
 /* config.c */

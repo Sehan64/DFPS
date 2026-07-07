@@ -39,11 +39,11 @@ void writeLog(int level, const char* fmt, ...) {
 /* ================================================================== */
 
 __attribute__((cold))
-void setupAbstractSocket(void) {
+bool setupAbstractSocket(void) {
     g_server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (g_server_fd < 0) {
         LOGE("Failed to create abstract socket descriptor.");
-        return;
+        return false;
     }
 
     struct sockaddr_un addr;
@@ -55,24 +55,24 @@ void setupAbstractSocket(void) {
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen("dfps");
     if (bind(g_server_fd, (struct sockaddr*)&addr, len) < 0) {
         if (errno == EADDRINUSE) {
-            LOGW("Abstract socket @dfps already in use — another DFPS instance may be running. "
-                 "Client connections disabled for this session.");
+            LOGE("Abstract socket @dfps already in use — another DFPS instance is running.");
         } else {
             LOGE("Failed binding abstract socket @dfps. Error: %s", strerror(errno));
         }
         close(g_server_fd);
         g_server_fd = -1;
-        return;
+        return false;
     }
 
     if (listen(g_server_fd, 5) < 0) {
         LOGE("Failed to set abstract socket to listen. Error: %s", strerror(errno));
         close(g_server_fd);
         g_server_fd = -1;
-        return;
+        return false;
     }
 
     LOGI("Abstract socket server successfully listening on: @dfps");
+    return true;
 }
 
 /* ================================================================== */

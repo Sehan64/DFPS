@@ -192,9 +192,9 @@ bool consumeShutdownSignal(void) {
 /* ================================================================== */
 
 int main(void) {
-    if (mlockall(MCL_CURRENT) != 0) {
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         /* Non-root and some kernels reject this; log but continue. */
-        LOGW("mlockall(MCL_CURRENT) failed: %s — pages may be paged out under pressure.",
+        LOGW("mlockall(MCL_CURRENT | MCL_FUTURE) failed: %s — pages may be paged out under pressure.",
              strerror(errno));
     }
     prctl(PR_SET_TIMERSLACK, 0);
@@ -205,7 +205,10 @@ int main(void) {
 
     struct sched_param sp = { .sched_priority = 2 };
     if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
-        setpriority(PRIO_PROCESS, 0, -20);
+        if (setpriority(PRIO_PROCESS, 0, -20) != 0) {
+            LOGW("setpriority(PRIO_PROCESS, 0, -20) failed after SCHED_FIFO was denied: %s",
+                 strerror(errno));
+        }
     }
 
     setupCpuAffinity();
@@ -273,6 +276,7 @@ int main(void) {
     g_hot_ops.readString     = (readString_t)dlsym(g_cold.lib, "AParcel_readString");
     g_hot_ops.deleteParcel   = (deleteParcel_t)dlsym(g_cold.lib, "AParcel_delete");
     g_cold.setThreadPoolMaxThreadCount = (setThreadPoolMaxThreadCount_t)dlsym(g_cold.lib, "ABinderProcess_setThreadPoolMaxThreadCount");
+    g_cold.startThreadPool   = (startThreadPool_t)dlsym(g_cold.lib, "ABinderProcess_startThreadPool");
     g_cold.joinThreadPool    = (joinThreadPool_t)dlsym(g_cold.lib, "ABinderProcess_joinThreadPool");
     g_hot_ops.writeInt32     = (writeInt32_t)dlsym(g_cold.lib, "AParcel_writeInt32");
     g_hot_ops.writeInt64     = (writeInt64_t)dlsym(g_cold.lib, "AParcel_writeInt64");
@@ -283,13 +287,14 @@ int main(void) {
         !g_cold.associateClass ||
         !g_hot_ops.prepareTransaction || !g_hot_ops.transact ||
         !g_hot_ops.readInt32 || !g_hot_ops.readFloat || !g_hot_ops.readString ||
-        !g_hot_ops.deleteParcel || !g_cold.joinThreadPool ||
+        !g_hot_ops.deleteParcel || !g_cold.startThreadPool ||
         !g_cold.writeString || !g_hot_ops.writeInt32 || !g_hot_ops.writeInt64) {
         LOGE("dlsym resolution failure.");
         return 1;
     }
 
     if (g_cold.setThreadPoolMaxThreadCount) g_cold.setThreadPoolMaxThreadCount(0);
+    g_cold.startThreadPool();
     if (g_cold.DeathRecipient_new)
         g_cold.deathRecipient = g_cold.DeathRecipient_new(onBinderDied);
 
@@ -345,6 +350,7 @@ int main(void) {
     if (g_cold.resolvedProcessObserverCode == 0 ||
         g_hot_ops.resolvedFocusedTaskCode == 0 ||
         g_hot_ops.resolvedForegroundCode == 0 ||
+        g_hot_ops.resolvedIsInteractiveCode == 0 ||
         g_hot_ops.resolvedApi == API_UNKNOWN) {
         LOGE("Core ActivityManager transaction code mapping failed. Halting.");
         return 1;
@@ -353,7 +359,9 @@ int main(void) {
     loadConfig();
     loadModesMap();
 
-    setupAbstractSocket();
+    if (!setupAbstractSocket()) {
+        return 1;
+    }
 
     /* Netlink uevent listener for battery events (root only) */
     if (g_root_mode) {
@@ -505,6 +513,8 @@ int main(void) {
     if (reply) g_hot_ops.deleteParcel(reply);
 
     queryFocusedTask();
-    g_cold.joinThreadPool();
+    while (!atomic_load_explicit(&g_shutdown_requested, memory_order_acquire)) {
+        usleep(250000);
+    }
     return 0;
 }

@@ -14,6 +14,10 @@
 
 SRC      := src/main.c src/utils.c src/config.c src/rate.c src/binder.c src/power.c src/touch.c
 PROFILE_STAMP = bin/$(ABI)/.profile-$(PROFILE)
+TEST_SRC := tests/reload_fallback_test.c
+TEST_DATA_DIR := $(abspath .testdata)
+TEST_CONFIG_PATH := $(TEST_DATA_DIR)/dfps.conf
+TEST_MODES_PATH := $(TEST_DATA_DIR)/modes.map
 
 # Auto-detect architecture (common on Termux)
 ARCH := $(shell uname -m)
@@ -66,7 +70,7 @@ endif
 CFLAGS += $(CFLAGS_EXTRA)
 LDFLAGS += $(LDFLAGS_EXTRA)
 
-.PHONY: all clean check debug arm64 arm x86_64 x86 install uninstall
+.PHONY: all clean check test debug arm64 arm x86_64 x86 install uninstall
 
 all: bin/$(ABI)/dfps
 
@@ -95,6 +99,20 @@ debug:
 check:
 >@clang -fsyntax-only $(CFLAGS) $(SRC) \
 >    && echo "syntax OK (Termux clang)"
+
+test: bin/$(ABI)/reload_fallback_test
+>@mkdir -p $(TEST_DATA_DIR)
+>@rm -f $(TEST_CONFIG_PATH) $(TEST_MODES_PATH)
+>@./bin/$(ABI)/reload_fallback_test
+
+bin/$(ABI)/reload_fallback_test: $(SRC) $(TEST_SRC) src/dfps.h $(PROFILE_STAMP)
+>@mkdir -p bin/$(ABI)
+>@echo "Building reload fallback regression test for $(ABI) ($(PROFILE))..."
+>@clang $(CFLAGS) -Dmain=dfps_main \
+>    -DDFPS_CONFIG_PATH=\"$(TEST_CONFIG_PATH)\" \
+>    -DDFPS_MODES_MAP_PATH=\"$(TEST_MODES_PATH)\" \
+>    $(SRC) $(TEST_SRC) -o $@ $(LDFLAGS)
+>@echo "-> $@"
 
 # Convenience targets
 arm64: all
