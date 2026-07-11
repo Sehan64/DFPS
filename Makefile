@@ -98,11 +98,29 @@ check:
 
 test:
 >@mkdir -p bin
->@echo "Building regression test..."
->@clang $(CFLAGS_COMMON) -Dmain=dfps_main \
->    tests/reload_fallback_test.c $(SRC) -o bin/test_dfps -ldl -lpthread
->@echo "Running regression test..."
->@./bin/test_dfps && echo "ALL REGRESSION TESTS PASSED"
+>@# Use a writable temp dir for the config/modes files. The test binaries
+>@# honor DFPS_CONFIG_PATH / DFPS_MODES_MAP_PATH, so this lets the suite
+>@# run unprivileged (Termux) and on plain-Linux CI runners, where the
+>@# default /data/local/tmp/dfps/ is not writable.
+>@DFPS_TEST_DIR=$$(mktemp -d) && echo "Test dir: $$DFPS_TEST_DIR" && \
+> echo "Building regression test (reload fallback)..." && \
+> clang $(CFLAGS_COMMON) -Dmain=dfps_main \
+>   -DDFPS_CONFIG_PATH="\"$$DFPS_TEST_DIR/dfps.conf\"" \
+>   -DDFPS_MODES_MAP_PATH="\"$$DFPS_TEST_DIR/modes.map\"" \
+>   tests/reload_fallback_test.c \
+>   src/main.c src/utils.c src/config.c src/rate.c \
+>   src/power.c src/touch.c tests/test_stubs.c -o bin/test_dfps -ldl -lpthread && \
+> ./bin/test_dfps && \
+> echo "Building regression test (config parser)..." && \
+> clang $(CFLAGS_COMMON) -Dmain=dfps_main \
+>   -DDFPS_CONFIG_PATH="\"$$DFPS_TEST_DIR/dfps.conf\"" \
+>   -DDFPS_MODES_MAP_PATH="\"$$DFPS_TEST_DIR/modes.map\"" \
+>   tests/config_parse_test.c \
+>   src/main.c src/utils.c src/config.c src/rate.c \
+>   src/power.c src/touch.c tests/test_stubs.c -o bin/test_cfg -ldl -lpthread && \
+> ./bin/test_cfg && \
+> rm -rf "$$DFPS_TEST_DIR" && \
+> echo "ALL REGRESSION TESTS PASSED"
 
 # Convenience targets
 arm64: all

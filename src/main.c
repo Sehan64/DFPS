@@ -62,6 +62,8 @@ _Atomic int32_t   g_battery_level = 100;
 _Atomic bool      g_min_brightness_clamp = false;
 _Atomic bool      g_display_callback_active = false;
 
+uint64_t         g_start_time = 0;
+
 /* Touch device fds */
 int  g_touch_fds[MAX_TOUCH_DEVICES];
 int  g_touch_fd_count = 0;
@@ -192,7 +194,30 @@ bool consumeShutdownSignal(void) {
 /*  Entry point                                                        */
 /* ================================================================== */
 
-int main(void) {
+#ifndef DFP_VERSION
+#define DFP_VERSION "1.0.0"
+#endif
+static const char* kDfpVersion = DFP_VERSION;
+static const char* kDfpBuild   = __DATE__ " " __TIME__;
+
+int main(int argc, char** argv) {
+    /* Version / help must work even when run unprivileged or before
+     * any heavy setup, so handle it first. */
+    if (argc > 1) {
+        if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
+            printf("dfpsd %s (build %s)\n", kDfpVersion, kDfpBuild);
+            return 0;
+        }
+        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            printf("dfpsd %s - Dynamic FPS Controller\n"
+                   "usage: dfpsd [-v|--version] [-h|--help]\n"
+                   "  -v, --version  print version and build stamp, then exit\n"
+                   "  -h, --help     print this help, then exit\n",
+                   kDfpVersion);
+            return 0;
+        }
+    }
+
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         /* Non-root and some kernels reject this; log but continue. */
         LOGW("mlockall(MCL_CURRENT | MCL_FUTURE) failed: %s — pages may be paged out under pressure.",
@@ -203,6 +228,26 @@ int main(void) {
     #define PR_SET_IO_FLUSHER 33
     #endif
     prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+
+    /* Hardening: the daemon runs as root (needed for /dev/input and the
+     * netlink uevent socket). Prevent it from gaining further
+     * privileges via a setuid helper, and stop it from leaking a
+     * core image or being ptraced by an unprivileged process.
+     * A full capability-set reduction is intentionally left to the init
+     * / SELinux context (see docs/INIT.md), where the exact caps
+     * required for input/uevent access are known. */
+    #ifndef PR_SET_NO_NEW_PRIVS
+    #define PR_SET_NO_NEW_PRIVS 38
+    #endif
+    #ifndef PR_SET_DUMPABLE
+    #define PR_SET_DUMPABLE 4
+    #endif
+    #ifndef PR_SET_KEEP_CAPS
+    #define PR_SET_KEEP_CAPS 7
+    #endif
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    prctl(PR_SET_KEEP_CAPS, 1, 0, 0, 0);
 
     struct sched_param sp = { .sched_priority = 2 };
     if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
@@ -245,6 +290,8 @@ int main(void) {
     g_root_mode = (my_uid == 0);
 
     initLogging();
+
+    g_start_time = getNowMs();
 
     LOGI("==============================================");
     LOGI("      Dynamic FPS Controller Initiated        ");

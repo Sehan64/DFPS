@@ -1,6 +1,7 @@
 # Build outputs
 bin/
 build/
+.tver/
 dfps.zip
 dfps.zip.bak
 *.o

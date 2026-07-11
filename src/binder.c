@@ -296,8 +296,13 @@ void queryFocusedTask(void) {
 
 void onBinderDied(void* cookie) {
     (void)cookie;
-    LOGE("Critical system binder service died! Exiting daemon for restart...");
-    exit(0);
+    LOGE("Critical system binder service died! Requesting graceful restart...");
+    /* Reuse the normal shutdown path: set the flag and wake the event
+     * loop so it unwinds (closes fds) and main() exits cleanly,
+     * letting the supervising init restart us. Abrupt exit(0) would
+     * skip cleanup and is harsher on whatever depended on us. */
+    consumeShutdownSignal();
+    triggerPollerWakeup();
 }
 
 /* ================================================================== */

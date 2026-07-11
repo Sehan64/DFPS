@@ -41,7 +41,9 @@
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#ifdef __ANDROID__
 #include <sys/system_properties.h>
+#endif
 #include <linux/netlink.h>
 #include <linux/input.h>
 #include <dirent.h>
@@ -288,6 +290,8 @@ extern _Atomic int32_t  g_power_save_max_rate;
 extern _Atomic bool     g_power_save_mode;
 extern _Atomic bool     g_low_battery_mode;
 extern _Atomic int32_t  g_battery_level;
+
+extern uint64_t         g_start_time;
 
 extern _Atomic bool     g_min_brightness_clamp;
 

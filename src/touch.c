@@ -16,6 +16,30 @@ static int s_touch_current_slot[MAX_TOUCH_DEVICES];
 /*  Touch device discovery                                             */
 /* ================================================================== */
 
+/* Return the peer's UID for an accepted AF_UNIX socket, or false if it
+ * cannot be determined (treat as unauthorized). Used to gate the @dfps
+ * control socket, which otherwise lets any local app learn the
+ * foreground package name. */
+static bool client_cred_uid(int fd, uid_t* out_uid) {
+    struct ucred cred;
+    socklen_t clen = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) != 0)
+        return false;
+    *out_uid = cred.uid;
+    return true;
+}
+
+/* The @dfps socket broadcasts the foreground package, which is sensitive.
+ * Only root, the daemon's own UID, and the Android shell (adb,
+ * AID_SHELL=2000) may connect. Anything else is refused. */
+static bool client_authorized(int fd) {
+    uid_t peer = (uid_t)-1;
+    if (!client_cred_uid(fd, &peer))
+        return false;
+    uid_t me = getuid();
+    return (peer == 0 || peer == me || peer == 2000);
+}
+
 void findTouchscreens(void) {
     LOGI("Scanning /dev/input nodes for touchscreen inputs...");
     DIR* dir = opendir("/dev/input");
@@ -252,6 +276,15 @@ void* touchListenerThread(void* arg) {
     #define TOUCH_EVENT_BATCH 64
     struct input_event evs[TOUCH_EVENT_BATCH];
 
+    /* Overhead note: this loop is the daemon's only hot path. It does one
+     * coarse CLOCK_MONOTONIC read per iteration (getNowMs, used both for the
+     * epoll timeout and below), no allocations, and no Binder traffic while
+     * the IDisplayManager callback is active (foreground/power/brightness
+     * arrive as events, not polls). The idle branch below is the only periodic
+     * work and is already minimal + battery-scan-gated. Further reductions
+     * (e.g. dropping the per-idle power-save probe) require on-device
+     * profiling (perfetto/systrace) to confirm they are safe — do not
+     * micro-optimize blind. */
     uint64_t now = getNowMs();
 
     while (!atomic_load_explicit(&g_shutdown_requested, memory_order_acquire)) {
@@ -422,6 +455,13 @@ void* touchListenerThread(void* arg) {
                             break;
                         }
 
+                        /* Authenticate the peer before any I/O. */
+                        if (!client_authorized(client_fd)) {
+                            LOGW("Rejected unauthorized @dfps client");
+                            close(client_fd);
+                            continue;
+                        }
+
                         pthread_spin_lock(&g_client_lock);
                         if (g_client_count < MAX_CLIENTS) {
                             struct epoll_event c_ev;
@@ -464,13 +504,45 @@ void* touchListenerThread(void* arg) {
 
             if (kind == FD_CLIENT) {
                 if (revents & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-                    char dummy[64];
-                    ssize_t n = recv(fd, dummy, sizeof(dummy), MSG_DONTWAIT);
-
+                    char buf[128];
+                    ssize_t n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
                     bool should_close = false;
-                    if (n == 0) {
+
+                    if (n > 0) {
+                        buf[n] = '\0';
+                        size_t l = (size_t)n;
+                        while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r'))
+                            buf[--l] = '\0';
+
+                        if (strcmp(buf, "STATUS") == 0) {
+                            /* Post-auth diagnostics snapshot. */
+                            uint64_t up = (g_start_time ? (getNowMs() - g_start_time) : 0);
+                            char health[256];
+                            int hl = snprintf(health, sizeof(health),
+                                "idle=%d active=%d last=%d interactive=%d powersave=%d "
+                                "lowbatt=%d minbright=%d callback=%d uptime_ms=%llu\n",
+                                (int)atomic_load_explicit(&g_curr_idle_rate, memory_order_relaxed),
+                                (int)atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed),
+                                (int)atomic_load_explicit(&g_last_set_rate, memory_order_relaxed),
+                                atomic_load_explicit(&g_screen_interactive, memory_order_relaxed) ? 1 : 0,
+                                atomic_load_explicit(&g_power_save_mode, memory_order_relaxed) ? 1 : 0,
+                                atomic_load_explicit(&g_low_battery_mode, memory_order_relaxed) ? 1 : 0,
+                                atomic_load_explicit(&g_min_brightness_clamp, memory_order_relaxed) ? 1 : 0,
+                                atomic_load_explicit(&g_display_callback_active, memory_order_relaxed) ? 1 : 0,
+                                (unsigned long long)(up));
+                            if (send(fd, health, (size_t)hl, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
+                                errno != EAGAIN) {
+                                /* Client vanished mid-send; drop below. */
+                                should_close = true;
+                            }
+                        } else {
+                            /* Unknown command from an authed client -> drop. */
+                            should_close = true;
+                        }
+                    } else if (n == 0) {
                         should_close = true;
-                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                               errno != EINTR) {
                         should_close = true;
                     }
 
