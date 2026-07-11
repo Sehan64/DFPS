@@ -1,11 +1,9 @@
-# Build outputs
-bin/
+# Build outputs (anchored to repo root so module/system/bin/ is not caught)
+/bin/
 build/
 .tver/
 dfps.zip
 dfps.zip.bak
-# Generated module binary (built from src/ by `make module`)
-module/system/bin/dfps
 *.o
 *.so
 *.a

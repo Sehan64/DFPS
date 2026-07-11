@@ -7,7 +7,7 @@ Runtime runbook for the `dfps` daemon. For protocol details see
 
 - Runs as root. One instance only — the `@dfps` singleton socket blocks a
   second copy at startup.
-- Started at boot by `service.sh` or the `dfps.rc` init service.
+- Started at boot by `service.sh` (the module's boot trigger).
 - Stops cleanly on `SIGTERM` / `SIGINT`: the event loop unwinds and `main()`
   returns, so the supervisor respawns a fresh instance if needed.
 
@@ -15,7 +15,7 @@ Runtime runbook for the `dfps` daemon. For protocol details see
 # Is it running?
 su -c 'pgrep -af /data/local/tmp/dfps/dfps'
 
-# Stop / restart (init will respawn via service.sh / dfps.rc)
+# Stop / restart (init will respawn via service.sh)
 su -c 'pkill -TERM -f /data/local/tmp/dfps/dfps'
 ```
 

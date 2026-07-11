@@ -27,7 +27,6 @@ foreground-package snapshots.
 
 - [BUILDING.md](docs/BUILDING.md)
 - [INSTALLATION.md](docs/INSTALLATION.md)
-- [MODULE_PACKAGING.md](docs/MODULE_PACKAGING.md)
 
 Quick start:
 
@@ -58,4 +57,5 @@ Runtime files:
 
 - `src/` contains the daemon.
 - `tests/` contains the regression checks.
-- `dfps.zip` is the shipped module archive.
+- `dfps.zip` is the module installer, published as a GitHub release (the repo
+  no longer builds it from source).

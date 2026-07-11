@@ -5,14 +5,10 @@ hardening it applies fits with the surrounding init / SELinux context.
 
 ## Boot launch
 
-The shipped module starts the daemon at boot. Two equivalent paths exist:
+The shipped module starts the daemon at boot:
 
 - **service.sh** (default for the tri-module): runs from the root manager's
   boot trigger and execs `/data/local/tmp/dfps/dfps`.
-- **dfps.rc** (native init): a direct `init` service. See `dfps.rc` in the
-  repo root for the exact `service` stanza. It uses `class main`, `user root`,
-  `group root input`, and `critical` so init respawns the daemon if it exits
-  (the daemon exits gracefully when a critical Binder service dies).
 
 The daemon itself:
 
@@ -54,8 +50,8 @@ needs depend on the device:
 
 Granting these is the job of the launching context, not the binary:
 
-- under **init** (`dfps.rc`): list them in the `capabilities` line
-  (`NET_ADMIN SYS_ADMIN`).
+- under **init** (a direct `init` service or the module's `service.sh`): grant
+  them via the service definition's `capabilities` line (`NET_ADMIN SYS_ADMIN`).
 - under **SELinux**: run in a domain (the `su` domain is the permissive
   fallback) that allows Binder transacts, the uevent netlink socket, and
   `/dev/input` open/read.
