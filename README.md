@@ -56,6 +56,12 @@ Runtime files:
 ## Source layout
 
 - `src/` contains the daemon.
-- `tests/` contains the regression checks.
+- `tests/` holds the regression checks. It is kept on-device for local
+  `make test` runs and is not published to the repo.
 - `dfps.zip` is the module installer, published as a GitHub release (the repo
   no longer builds it from source).
+
+## License
+
+DFPS is licensed under the Apache License, Version 2.0. See
+[LICENSE](LICENSE) for the full text.

@@ -7,46 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: Regression tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang make
-
-      - name: Run regression tests
-        # `make test` builds and runs the regression suite. It excludes
-        # binder.c (Android-only: pulls in __system_property_get) and links
-        # the real sources against tests/test_stubs.c, so it runs on plain
-        # Linux without the NDK. The full daemon (`make`) and `make check`
-        # compile binder.c and require the Android NDK / Bionic headers; they
-        # are validated on-device.
-        run: make test
-
-  sanitizers:
-    name: Regression tests (ASan + UBSan)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang make
-
-      - name: Run regression tests under AddressSanitizer + UndefinedBehaviorSanitizer
-        # SAN=1 rebuilds every test binary with -fsanitize=address,undefined
-        # and runs the suite. Leak detection is disabled (ASAN_OPTIONS) because
-        # the long-lived daemon intentionally holds memory for its lifetime;
-        # UBSan is set to print stack traces on the first UB hit.
-        run: make test SAN=1
-
   static-analysis:
     name: clang-tidy static analysis
     runs-on: ubuntu-latest
