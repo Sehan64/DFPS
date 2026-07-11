@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang make
+
+      - name: Run regression tests
+        # `make test` builds and runs the regression suite. It excludes
+        # binder.c (Android-only: pulls in __system_property_get) and links
+        # the real sources against tests/test_stubs.c, so it runs on plain
+        # Linux without the NDK. The full daemon (`make`) and `make check`
+        # compile binder.c and require the Android NDK / Bionic headers; they
+        # are validated on-device.
+        run: make test
