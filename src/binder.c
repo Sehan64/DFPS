@@ -204,7 +204,12 @@ static inline void emitChangedForegroundPackages(void) {
     g_last_package_count = n;
     for (int i = 0; i < n; ++i) {
         uint8_t slash = slashes[i];
+        /* Bound the prefix to its buffer so an unusually long package name
+         * cannot overflow g_last_package_prefixes[].buf (124 bytes). */
+        if (slash > (uint8_t)(sizeof(g_last_package_prefixes[i].buf) - 1))
+            slash = (uint8_t)(sizeof(g_last_package_prefixes[i].buf) - 1);
         memcpy(g_last_package_prefixes[i].buf, g_child_task_names[i].buf, slash);
+        g_last_package_prefixes[i].buf[slash] = '\0';
         g_last_package_prefixes[i].len = (int32_t)slash;
     }
 
@@ -216,8 +221,10 @@ static inline void emitChangedForegroundPackages(void) {
     if (n > 0) {
         char first_pkg[128];
         int slash_len = slashes[0];
-        if (slash_len > 127) slash_len = 127;
-        memcpy(first_pkg, g_child_task_names[0].buf, slash_len);
+        if (slash_len < 0) slash_len = 0;
+        if (slash_len > (int)sizeof(first_pkg) - 1)
+            slash_len = (int)sizeof(first_pkg) - 1;
+        memcpy(first_pkg, g_child_task_names[0].buf, (size_t)slash_len);
         first_pkg[slash_len] = '\0';
 
         updateCurrentAppRates(first_pkg);
@@ -372,7 +379,7 @@ static int resolveAllFields(const char* jar_path,
     pid_t pid = 0;
     int rc = posix_spawn(&pid, "/system/bin/app_process", &actions, NULL, argv, envp);
     posix_spawn_file_actions_destroy(&actions);
-    free(envp);
+    free((void*)envp);
     close(pipefd[1]);
 
     if (rc != 0) {
@@ -514,11 +521,10 @@ __attribute__((cold))
 void resolveTransactionCodes(void) {
     const char* cache_path = "/data/local/tmp/dfps/tx_code.txt";
 
-    char current_fp[256] = {0};
+    char current_fp[256] = "unknown";
+#ifdef __ANDROID__
     __system_property_get("ro.build.fingerprint", current_fp);
-    if (current_fp[0] == '\0') {
-        strcpy(current_fp, "unknown");
-    }
+#endif
 
     /* Try loading from cache first */
     FILE* cache_f = NULL;

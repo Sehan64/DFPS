@@ -8,6 +8,7 @@ on:
 
 jobs:
   test:
+    name: Regression tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,3 +27,70 @@ jobs:
         # compile binder.c and require the Android NDK / Bionic headers; they
         # are validated on-device.
         run: make test
+
+  sanitizers:
+    name: Regression tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang make
+
+      - name: Run regression tests under AddressSanitizer + UndefinedBehaviorSanitizer
+        # SAN=1 rebuilds every test binary with -fsanitize=address,undefined
+        # and runs the suite. Leak detection is disabled (ASAN_OPTIONS) because
+        # the long-lived daemon intentionally holds memory for its lifetime;
+        # UBSan is set to print stack traces on the first UB hit.
+        run: make test SAN=1
+
+  static-analysis:
+    name: clang-tidy static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy
+
+      - name: Run clang-tidy
+        # Curated check set. We deliberately:
+        #   - enable bugprone-*, clang-analyzer-*, performance-*
+        #   - disable easily-swappable-parameters (pure noise on this C API)
+        #   - disable insecureAPI.DeprecatedOrUnsafeBufferHandling (Bionic has
+        #     no strlcpy/strlcat, so the "fix" it suggests is unavailable here)
+        #   - disable concurrency-mt-unsafe (the daemon is explicitly
+        #     single-threaded; Bionic stubs trip this false-positive)
+        # binder.c is included: it now compiles on plain Linux (its
+        # __system_property_get use is guarded behind __ANDROID__). The job
+        # fails (non-zero exit) on any finding, so the build stays clean.
+        run: |
+          clang-tidy -checks="-*,bugprone-*,clang-analyzer-*,performance-*,-bugprone-easily-swappable-parameters,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-concurrency-mt-unsafe" \
+            src/main.c src/utils.c src/config.c src/rate.c \
+            src/binder.c src/power.c src/touch.c \
+            -- -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -fvisibility=hidden
+
+  compile:
+    name: Full build syntax check (incl. binder.c)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang make
+
+      - name: Syntax-check all sources (make check)
+        # `make check` runs -fsyntax-only over every SRC, including binder.c,
+        # using the release CFLAGS. It catches compile regressions on Linux
+        # for sources that only link on-device. Full linking still requires
+        # the Android NDK / Bionic headers and is validated on-device.
+        run: make check

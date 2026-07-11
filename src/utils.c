@@ -50,7 +50,7 @@ bool setupAbstractSocket(void) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     addr.sun_path[0] = '\0';
-    strcpy(&addr.sun_path[1], "dfps");
+    strlcpy(&addr.sun_path[1], "dfps", sizeof(addr.sun_path) - 1);
 
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen("dfps");
     if (bind(g_server_fd, (struct sockaddr*)&addr, len) < 0) {
@@ -99,6 +99,8 @@ char** buildResolverEnv(const char* jar_path) {
         if (strncmp(*e, "CLASSPATH=", 10) == 0 ||
             strncmp(*e, "LD_LIBRARY_PATH=", 16) == 0 ||
             strncmp(*e, "LD_PRELOAD=", 11) == 0) continue;
+        /* Defensive: (count+2) slots were allocated; never overrun. */
+        if (idx >= count + 1) break;
         envp[idx++] = *e;
     }
     envp[idx] = NULL;

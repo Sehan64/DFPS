@@ -48,7 +48,8 @@ int32_t readInitialBatteryLevel(void) {
         if (f) {
             char type[32] = {0};
             if (fgets(type, sizeof(type), f)) {
-                type[strcspn(type, "\n")] = 0;
+                size_t nl = strcspn(type, "\n");
+                if (nl < sizeof(type)) type[nl] = '\0';
                 if (strcmp(type, "Battery") == 0) {
                     fclose(f);
                     strlcpy(s_battery_supply_name, entry->d_name,

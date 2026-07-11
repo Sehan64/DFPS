@@ -31,6 +31,10 @@ tmp_*
 .DS_Store
 Thumbs.db
 
+# Static analysis / clang-tidy scratch
+compile_commands.json
+tidy*.out
+
 # Tool caches and package/build directories
 __pycache__/
 *.pyc

@@ -114,7 +114,7 @@ static void setupInotify(void) {
         return;
     }
 
-    strcpy(g_watch_dir, "/data/local/tmp/dfps");
+    strlcpy(g_watch_dir, "/data/local/tmp/dfps", PATH_MAX);
     g_inotify_wd = inotify_add_watch(g_inotify_fd, g_watch_dir,
                                       IN_CLOSE_WRITE | IN_MOVED_TO);
     if (g_inotify_wd >= 0) {
@@ -539,11 +539,14 @@ void* touchListenerThread(void* arg) {
                             /* Unknown command from an authed client -> drop. */
                             should_close = true;
                         }
-                    } else if (n == 0) {
-                        should_close = true;
-                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                               errno != EINTR) {
-                        should_close = true;
+                    } else {
+                        /* Clean EOF (n == 0) or a hard read error drops the
+                         * client; EAGAIN/EWOULDBLOCK/EINTR are transient. */
+                        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                                     errno == EINTR))
+                            should_close = false;
+                        else
+                            should_close = true;
                     }
 
                     if (should_close) {

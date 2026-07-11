@@ -45,6 +45,16 @@ CFLAGS_COMMON := -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
 # same binary. Override with DFP_BUILD_STAMP=... when building outside a tree.
 BUILD_STAMP ?= $(shell git describe --always --dirty --tags 2>/dev/null || echo unknown)
 
+# Sanitizer support for `make test SAN=1` (ASan + UBSan). The regression
+# binaries are built with -fsanitize=... so memory/UB bugs in the exercised
+# code (config parsing, reload) surface at runtime. Leak detection at exit is
+# disabled: the test binaries never run the daemon's full teardown, so
+# intentionally-global allocations would otherwise be reported as leaks.
+ifeq ($(SAN),1)
+SAN_CFLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -g3
+SAN_ENV    := ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1
+endif
+
 ifeq ($(PROFILE),release)
     # Wide-compatibility baseline instead of -march=native. Native tuning makes
     # binaries that may crash on older CPUs (e.g. CRC32/SHA1/FP16 instructions).
@@ -111,21 +121,21 @@ test:
 >@# default /data/local/tmp/dfps/ is not writable.
 >@DFPS_TEST_DIR=$$(mktemp -d) && echo "Test dir: $$DFPS_TEST_DIR" && \
 > echo "Building regression test (reload fallback)..." && \
-> clang $(CFLAGS_COMMON) -Dmain=dfps_main \
+> clang $(CFLAGS_COMMON) $(SAN_CFLAGS) -Dmain=dfps_main \
 >   -DDFPS_CONFIG_PATH="\"$$DFPS_TEST_DIR/dfps.conf\"" \
 >   -DDFPS_MODES_MAP_PATH="\"$$DFPS_TEST_DIR/modes.map\"" \
 >   tests/reload_fallback_test.c \
 >   src/main.c src/utils.c src/config.c src/rate.c \
 >   src/power.c src/touch.c tests/test_stubs.c -o bin/test_dfps -ldl -lpthread && \
-> ./bin/test_dfps && \
+> $(SAN_ENV) ./bin/test_dfps && \
 > echo "Building regression test (config parser)..." && \
-> clang $(CFLAGS_COMMON) -Dmain=dfps_main \
+> clang $(CFLAGS_COMMON) $(SAN_CFLAGS) -Dmain=dfps_main \
 >   -DDFPS_CONFIG_PATH="\"$$DFPS_TEST_DIR/dfps.conf\"" \
 >   -DDFPS_MODES_MAP_PATH="\"$$DFPS_TEST_DIR/modes.map\"" \
 >   tests/config_parse_test.c \
 >   src/main.c src/utils.c src/config.c src/rate.c \
 >   src/power.c src/touch.c tests/test_stubs.c -o bin/test_cfg -ldl -lpthread && \
-> ./bin/test_cfg && \
+> $(SAN_ENV) ./bin/test_cfg && \
 > rm -rf "$$DFPS_TEST_DIR" && \
 > echo "ALL REGRESSION TESTS PASSED"
 

@@ -120,7 +120,7 @@ void rebuildRuleHash(void) {
         /* Open addressing with linear probing. MAX_RULES << RULE_HASH_SLOTS,
          * so collisions are rare and the loop always terminates. */
         for (int probe = 0; probe < RULE_HASH_SLOTS; probe++) {
-            int slot = (h + (uint32_t)probe) & RULE_HASH_MASK;
+            int slot = (int)((h + (uint32_t)probe) & RULE_HASH_MASK);
             if (g_rule_hash[slot].index < 0) {
                 g_rule_hash[slot].index = i;
                 break;
@@ -161,7 +161,7 @@ void loadConfig(void) {
             char* hash = strchr(line, '#');
             if (hash) *hash = '\0';
 
-            int len = strlen(line);
+            int len = (int)strlen(line);
             while (len > 0 && isspace((unsigned char)line[len-1])) {
                 line[--len] = '\0';
             }

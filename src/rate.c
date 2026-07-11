@@ -197,7 +197,7 @@ void updateCurrentAppRates(const char* pkg) {
     pthread_rwlock_rdlock(&g_config_lock);
     uint32_t h = hash_string_fnv1a(pkg) & RULE_HASH_MASK;
     for (int probe = 0; probe < RULE_HASH_SLOTS; probe++) {
-        int slot = (h + (uint32_t)probe) & RULE_HASH_MASK;
+        int slot = (int)((h + (uint32_t)probe) & RULE_HASH_MASK);
         int idx = g_rule_hash[slot].index;
         if (idx < 0) break; /* Empty slot — package has no rule. */
         if (strcmp(g_rules[idx].pkg, pkg) == 0) {

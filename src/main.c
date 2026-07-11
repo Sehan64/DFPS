@@ -549,7 +549,7 @@ int main(int argc, char** argv) {
     pthread_t touch_thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256 * 1024);
+    pthread_attr_setstacksize(&attr, (size_t)256 * 1024);
     if (pthread_create(&touch_thread, &attr, touchListenerThread, NULL) != 0) {
         LOGE("Failed to create touch thread");
         return 1;
