@@ -1,5 +1,8 @@
 # Configuration
 
+For a user-facing configuration guide (with the rationale behind each option),
+see [`HELP.md`](./HELP.md).
+
 DFPS reads two runtime files from `/data/local/tmp/dfps/`:
 
 - `dfps.conf`
