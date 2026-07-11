@@ -30,15 +30,15 @@ binder_status_t displayCallbackOnTransact(AIBinder* binder, transaction_code_t c
                 /* event 2 -> EVENT_DISPLAY_CHANGED */
                 /* event 4 -> EVENT_DISPLAY_BRIGHTNESS_CHANGED */
                 if (event == 2) {
-                    checkInteractiveAndPowerSave();
+                    checkInteractiveAndPowerSave(true);
                 } else if (event == 4) {
                     checkMinBrightness();
                 } else {
-                    checkInteractiveAndPowerSave();
+                    checkInteractiveAndPowerSave(true);
                     checkMinBrightness();
                 }
             } else {
-                checkInteractiveAndPowerSave();
+                checkInteractiveAndPowerSave(true);
                 checkMinBrightness();
             }
         }
@@ -603,7 +603,6 @@ void resolveTransactionCodes(void) {
     /* Regenerate via app_process resolver */
     LOGI("Generating system transaction resolver mappings...");
     /* Use compile-time constant from generated header for reliable size check */
-    extern const unsigned char _resolver_jar_size;
     #ifdef RESOLVER_JAR_SIZE
         static const size_t RESOLVER_SIZE = RESOLVER_JAR_SIZE;
     #else

@@ -23,8 +23,8 @@ pthread_rwlock_t  g_config_lock;
 
 ModeMapEntry      g_modes[MAX_MODES];
 int               g_mode_count = 0;
-int32_t           g_max_physical_rate = 0;
-int32_t           g_min_physical_rate = 0;
+_Atomic int32_t   g_max_physical_rate = 0;
+_Atomic int32_t   g_min_physical_rate = 0;
 
 /* Runtime tuning */
 _Atomic int32_t   g_touch_slack_ms = 4000;
@@ -33,9 +33,9 @@ _Atomic bool      g_enable_min_brightness = false;
 _Atomic int32_t   g_min_brightness_threshold = 0;
 _Atomic bool      g_debug = false;
 
-int32_t           g_offscreen_rate = -1;
-int32_t           g_default_idle_rate = 60;
-int32_t           g_default_active_rate = 120;
+_Atomic int32_t   g_offscreen_rate = -1;
+_Atomic int32_t    g_default_idle_rate = 60;
+_Atomic int32_t    g_default_active_rate = 120;
 
 /* Current rate state */
 _Atomic int32_t   g_curr_idle_rate = 60;
@@ -60,6 +60,7 @@ _Atomic bool      g_low_battery_mode = false;
 _Atomic int32_t   g_battery_level = 100;
 
 _Atomic bool      g_min_brightness_clamp = false;
+_Atomic bool      g_display_callback_active = false;
 
 /* Touch device fds */
 int  g_touch_fds[MAX_TOUCH_DEVICES];
@@ -480,6 +481,9 @@ int main(void) {
                             if (reg_status != STATUS_OK) {
                                 LOGE("Failed to register display callback (code %u): status %d",
                                      reg_code, reg_status);
+                            } else {
+                                atomic_store_explicit(&g_display_callback_active, true,
+                                                      memory_order_relaxed);
                             }
                             if (reply) g_hot_ops.deleteParcel(reply);
                         }
@@ -489,7 +493,7 @@ int main(void) {
         }
     }
 
-    checkInteractiveAndPowerSave();
+    checkInteractiveAndPowerSave(true);
     checkMinBrightness();
 
     /* Register process observer for foreground app tracking */

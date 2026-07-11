@@ -16,7 +16,7 @@ top-level `Makefile`.
 make          # release build
 make debug    # ASan + UBSan build
 make check    # syntax-only check
-make test     # regression test(s)
+make test     # build and run the regression tests
 make install  # copy binary to /data/local/tmp/dfps/bin/dfps
 ```
 
@@ -41,8 +41,10 @@ compilation checks.
 
 ## Test build
 
-`make test` builds a small regression binary and runs it against local test
-data. The tests live under `tests/` and use temporary files in `.testdata/`.
+`make test` compiles the regression tests under `tests/` (linked against the
+real source so they exercise `loadConfig()` / `loadModesMap()` and the
+config globals) and runs them. The tests write temporary files under
+`/data/local/tmp/dfps/`, which must already exist.
 
 ## Cross builds
 

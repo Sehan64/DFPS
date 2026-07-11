@@ -87,8 +87,8 @@ void loadModesMap(void) {
     if (temp_mode_count > 0) {
         memcpy(g_modes, temp_modes, sizeof(ModeMapEntry) * temp_mode_count);
     }
-    g_max_physical_rate = temp_max_rate;
-    g_min_physical_rate = temp_min_rate;
+    atomic_store_explicit(&g_max_physical_rate, temp_max_rate, memory_order_release);
+    atomic_store_explicit(&g_min_physical_rate, temp_min_rate, memory_order_release);
     invalidateRateModeCache();
     pthread_rwlock_unlock(&g_config_lock);
 
@@ -268,6 +268,12 @@ void loadConfig(void) {
         temp_min_bright_threshold = 0;
     }
 
+    if (!temp_battery_saver &&
+        (temp_low_battery_threshold != 10 || temp_power_save_max_rate != 60)) {
+        LOGW("dfps.conf: batterySaver=false, so lowBatteryThreshold and "
+             "powerSaveMaxRate have no effect until batterySaver=true.");
+    }
+
     atomic_store(&g_debug, temp_debug);
     bool old_frame_rate_flex = atomic_exchange_explicit(
         &g_enable_frame_rate_flex, temp_frame_rate_flex, memory_order_acq_rel);
@@ -281,9 +287,9 @@ void loadConfig(void) {
     if (temp_rule_count > 0) {
         memcpy(g_rules, temp_rules, sizeof(PerAppRule) * temp_rule_count);
     }
-    g_offscreen_rate = temp_offscreen_rate;
-    g_default_idle_rate = temp_default_idle;
-    g_default_active_rate = temp_default_active;
+    atomic_store_explicit(&g_offscreen_rate, temp_offscreen_rate, memory_order_release);
+    atomic_store_explicit(&g_default_idle_rate, temp_default_idle, memory_order_release);
+    atomic_store_explicit(&g_default_active_rate, temp_default_active, memory_order_release);
     rebuildRuleHash();
     pthread_rwlock_unlock(&g_config_lock);
 

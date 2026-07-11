@@ -254,8 +254,8 @@ extern pthread_rwlock_t g_config_lock;
 
 extern ModeMapEntry    g_modes[MAX_MODES];
 extern int             g_mode_count;
-extern int32_t         g_max_physical_rate;
-extern int32_t         g_min_physical_rate;
+extern _Atomic int32_t  g_max_physical_rate;
+extern _Atomic int32_t  g_min_physical_rate;
 
 /* Runtime tuning */
 extern _Atomic int32_t g_touch_slack_ms;
@@ -264,9 +264,9 @@ extern _Atomic bool    g_enable_min_brightness;
 extern _Atomic int32_t g_min_brightness_threshold;
 extern _Atomic bool    g_debug;
 
-extern int32_t         g_offscreen_rate;
-extern int32_t         g_default_idle_rate;
-extern int32_t         g_default_active_rate;
+extern _Atomic int32_t g_offscreen_rate;
+extern _Atomic int32_t  g_default_idle_rate;
+extern _Atomic int32_t  g_default_active_rate;
 
 /* Current rate state */
 extern _Atomic int32_t g_curr_idle_rate;
@@ -290,6 +290,11 @@ extern _Atomic bool     g_low_battery_mode;
 extern _Atomic int32_t  g_battery_level;
 
 extern _Atomic bool     g_min_brightness_clamp;
+
+/* Set once the IDisplayManager callback is successfully registered. While
+ * true, interactive/brightness changes arrive via the callback, so the
+ * periodic idle-timeout re-queries are skipped to save binder traffic. */
+extern _Atomic bool     g_display_callback_active;
 
 /* Touch device fds */
 extern int  g_touch_fds[MAX_TOUCH_DEVICES];
@@ -436,7 +441,7 @@ void onBinderDied(void* cookie);
 
 /* power.c */
 int32_t readInitialBatteryLevel(void);
-void    checkInteractiveAndPowerSave(void);
+void    checkInteractiveAndPowerSave(bool probe_interactive);
 void    checkMinBrightness(void);
 void    evaluateBatteryState(int32_t level);
 bool    handleUevent(void);

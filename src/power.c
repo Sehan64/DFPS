@@ -76,37 +76,45 @@ int32_t readInitialBatteryLevel(void) {
 /*  Interactive / power-save state queries (Binder)                    */
 /* ================================================================== */
 
-void checkInteractiveAndPowerSave(void) {
+void checkInteractiveAndPowerSave(bool probe_interactive) {
     if (!g_hot_binders.powerManager) return;
 
-    /* Query isInteractive */
-    AParcel* in = NULL;
-    if (g_hot_ops.prepareTransaction(g_hot_binders.powerManager, &in) == STATUS_OK && in) {
-        AParcel* reply = NULL;
-        binder_status_t status = g_hot_ops.transact(
-            g_hot_binders.powerManager,
-            g_hot_ops.resolvedIsInteractiveCode, &in, &reply, 0);
-        if (status == STATUS_OK && reply) {
-            int32_t exception = -1;
-            int32_t result = -1;
-            if (g_hot_ops.readInt32(reply, &exception) == STATUS_OK && exception == 0) {
-                if (g_hot_ops.readInt32(reply, &result) == STATUS_OK) {
-                    bool interactive = (result != 0);
-                    if (interactive != atomic_load_explicit(&g_screen_interactive,
-                                                             memory_order_relaxed)) {
-                        LOGI("Interactive screen state changed: screen is now %s",
-                             interactive ? "ON" : "OFF");
-                        atomic_store_explicit(&g_screen_interactive, interactive,
-                                               memory_order_release);
-                        triggerPollerWakeup();
+    /* Query isInteractive.
+     * When the IDisplayManager callback is registered, interactive-state
+     * changes arrive via that callback (event 2), so callers in the polling
+     * path pass probe_interactive=false to avoid a redundant binder query.
+     * The power-save-mode probe below is ALWAYS performed: the display
+     * callback does not deliver power-save-mode transitions, so skipping it
+     * would leave g_power_save_mode stale and defeat the power-save cap. */
+    if (probe_interactive) {
+        AParcel* in = NULL;
+        if (g_hot_ops.prepareTransaction(g_hot_binders.powerManager, &in) == STATUS_OK && in) {
+            AParcel* reply = NULL;
+            binder_status_t status = g_hot_ops.transact(
+                g_hot_binders.powerManager,
+                g_hot_ops.resolvedIsInteractiveCode, &in, &reply, 0);
+            if (status == STATUS_OK && reply) {
+                int32_t exception = -1;
+                int32_t result = -1;
+                if (g_hot_ops.readInt32(reply, &exception) == STATUS_OK && exception == 0) {
+                    if (g_hot_ops.readInt32(reply, &result) == STATUS_OK) {
+                        bool interactive = (result != 0);
+                        if (interactive != atomic_load_explicit(&g_screen_interactive,
+                                                                 memory_order_relaxed)) {
+                            LOGI("Interactive screen state changed: screen is now %s",
+                                  interactive ? "ON" : "OFF");
+                            atomic_store_explicit(&g_screen_interactive, interactive,
+                                                   memory_order_release);
+                            triggerPollerWakeup();
+                        }
                     }
                 }
+                g_hot_ops.deleteParcel(reply);
             }
-            g_hot_ops.deleteParcel(reply);
         }
     }
 
-    /* Query isPowerSaveMode */
+    /* Query isPowerSaveMode — always probe (see note above). */
     if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed) &&
         g_hot_ops.resolvedIsPowerSaveModeCode != 0) {
         AParcel* in2 = NULL;

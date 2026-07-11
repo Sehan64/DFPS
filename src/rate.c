@@ -119,15 +119,16 @@ void setSurfaceFlingerFrameRateFlex(bool enable) {
 void setRefreshRate(int32_t rate) {
     if (rate <= 0) return;
 
-    if (g_max_physical_rate > 0 && rate > g_max_physical_rate) {
+    int32_t max_phys = atomic_load_explicit(&g_max_physical_rate, memory_order_relaxed);
+    if (max_phys > 0 && rate > max_phys) {
         static _Atomic int32_t last_warned_rate = -1;
         if (rate != atomic_load_explicit(&last_warned_rate, memory_order_relaxed)) {
             LOGW("Requested rate %d Hz exceeds device maximum (%d Hz). "
                  "Clamping output to %d Hz.",
-                 rate, g_max_physical_rate, g_max_physical_rate);
+                  rate, max_phys, max_phys);
             atomic_store_explicit(&last_warned_rate, rate, memory_order_relaxed);
         }
-        rate = g_max_physical_rate;
+        rate = max_phys;
     }
 
     if (atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == rate) return;
@@ -148,12 +149,11 @@ void updateRateState(void) {
     bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
     int32_t target_rate = -1;
 
-    /* Snapshot config values under a single read lock */
-    pthread_rwlock_rdlock(&g_config_lock);
-    int32_t offscreen = g_offscreen_rate;
-    int32_t min_phys  = g_min_physical_rate;
-    int32_t def_idle  = g_default_idle_rate;
-    pthread_rwlock_unlock(&g_config_lock);
+    /* Config scalars are atomics: read lock-free to avoid a futex syscall on
+     * every rate evaluation in the hot path. */
+    int32_t offscreen = atomic_load_explicit(&g_offscreen_rate, memory_order_relaxed);
+    int32_t min_phys  = atomic_load_explicit(&g_min_physical_rate, memory_order_relaxed);
+    int32_t def_idle  = atomic_load_explicit(&g_default_idle_rate, memory_order_relaxed);
 
     if (!interactive) {
         if (offscreen > 0) {
@@ -201,15 +201,15 @@ void updateCurrentAppRates(const char* pkg) {
         int idx = g_rule_hash[slot].index;
         if (idx < 0) break; /* Empty slot — package has no rule. */
         if (strcmp(g_rules[idx].pkg, pkg) == 0) {
-            new_idle   = (g_rules[idx].idle == -1)   ? g_default_idle_rate   : g_rules[idx].idle;
-            new_active = (g_rules[idx].active == -1) ? g_default_active_rate : g_rules[idx].active;
+            new_idle   = (g_rules[idx].idle == -1)   ? atomic_load_explicit(&g_default_idle_rate, memory_order_relaxed)   : g_rules[idx].idle;
+            new_active = (g_rules[idx].active == -1) ? atomic_load_explicit(&g_default_active_rate, memory_order_relaxed) : g_rules[idx].active;
             found = true;
             break;
         }
     }
     if (!found) {
-        new_idle   = g_default_idle_rate;
-        new_active = g_default_active_rate;
+        new_idle   = atomic_load_explicit(&g_default_idle_rate, memory_order_relaxed);
+        new_active = atomic_load_explicit(&g_default_active_rate, memory_order_relaxed);
     }
     pthread_rwlock_unlock(&g_config_lock);
 
@@ -233,5 +233,9 @@ void updateCurrentAppRates(const char* pkg) {
              "Transitions will not occur within '%s'.", new_idle, pkg);
     }
 
-    triggerPollerWakeup();
+    /* No wakeup here: both callers (emitChangedForegroundPackages via the
+     * wakeup path, and handleInotifyEvents via the FD_INOTIFY branch) already
+     * set needs_rate_update = true, so updateRateState() runs in the same
+     * epoll iteration. An extra eventfd write would just cause a spurious
+     * second wakeup. */
 }

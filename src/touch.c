@@ -268,8 +268,20 @@ void* touchListenerThread(void* arg) {
         bool needs_rate_update = (nfds == 0);
 
         if (nfds == 0) {
-            checkInteractiveAndPowerSave();
-            checkMinBrightness();
+            bool cb_active = atomic_load_explicit(&g_display_callback_active,
+                                                memory_order_relaxed);
+            if (!cb_active) {
+                /* No display callback: poll interactive, power-save, and
+                 * brightness state the old-fashioned way. */
+                checkInteractiveAndPowerSave(true);
+                checkMinBrightness();
+            } else {
+                /* The IDisplayManager callback delivers interactive (event 2)
+                 * and brightness (event 4) changes, so skip those two queries
+                 * here. It does NOT deliver power-save-mode transitions, so we
+                 * still probe power-save to keep g_power_save_mode current. */
+                checkInteractiveAndPowerSave(false);
+            }
             /* Rate-limit battery sysfs scan to every 30 seconds to avoid
              * repeated opendir/readdir/fopen overhead on every idle timeout. */
             if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed)) {

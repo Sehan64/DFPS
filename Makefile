@@ -66,7 +66,7 @@ endif
 CFLAGS += $(CFLAGS_EXTRA)
 LDFLAGS += $(LDFLAGS_EXTRA)
 
-.PHONY: all clean check debug arm64 arm x86_64 x86 install uninstall
+.PHONY: all clean check test debug arm64 arm x86_64 x86 install uninstall
 
 all: bin/$(ABI)/dfps
 
@@ -95,6 +95,14 @@ debug:
 check:
 >@clang -fsyntax-only $(CFLAGS) $(SRC) \
 >    && echo "syntax OK (Termux clang)"
+
+test:
+>@mkdir -p bin
+>@echo "Building regression test..."
+>@clang $(CFLAGS_COMMON) -Dmain=dfps_main \
+>    tests/reload_fallback_test.c $(SRC) -o bin/test_dfps -ldl -lpthread
+>@echo "Running regression test..."
+>@./bin/test_dfps && echo "ALL REGRESSION TESTS PASSED"
 
 # Convenience targets
 arm64: all
