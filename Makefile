@@ -37,6 +37,11 @@ endif
 # Build profile: release (default) or debug
 PROFILE ?= release
 
+# Module packaging: `make module` builds the daemon, drops the binary into
+# module/system/bin/ and zips module/ -> dfps.zip (the AxManager installer).
+MODULE_DIR := module
+MODULE_ZIP := dfps.zip
+
 # Common flags
 CFLAGS_COMMON := -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
                  -D_GNU_SOURCE -fvisibility=hidden
@@ -83,7 +88,7 @@ endif
 CFLAGS += $(CFLAGS_EXTRA)
 LDFLAGS += $(LDFLAGS_EXTRA)
 
-.PHONY: all clean check test debug arm64 arm x86_64 x86 install uninstall
+.PHONY: all clean check test debug arm64 arm x86_64 x86 install uninstall module
 
 all: bin/$(ABI)/dfps
 
@@ -156,3 +161,17 @@ install: all
 uninstall:
 >@rm -f /data/local/tmp/dfps/bin/dfps
 >@echo "Uninstalled dfps"
+
+# Package the AxManager/KernelSU module installer (dfps.zip) from module/.
+# Builds the daemon first, copies it into module/system/bin/, then zips the
+# module source. Prefers `zip` when present, falls back to tools/zip_module.py.
+module: all
+>@mkdir -p "$(MODULE_DIR)/system/bin"
+>@cp "bin/$(ABI)/dfps" "$(MODULE_DIR)/system/bin/dfps"
+>@echo "Packaging $(MODULE_ZIP) from $(MODULE_DIR)/..."
+>@if command -v zip >/dev/null 2>&1; then \
+>   ( cd "$(MODULE_DIR)" && zip -r9 "../$(MODULE_ZIP)" . ); \
+> else \
+>   python3 tools/zip_module.py "$(MODULE_DIR)" "$(MODULE_ZIP)"; \
+>fi
+>@echo "-> $(MODULE_ZIP)"
