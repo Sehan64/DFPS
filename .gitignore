@@ -12,6 +12,9 @@ dfps.zip.bak
 gh_token.txt
 /data/local/tmp/dfps/
 
+# Regression tests: kept on device for local `make test`, not published
+/tests/
+
 # Logs and temporary files
 *.log
 *.tmp
