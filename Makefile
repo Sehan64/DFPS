@@ -41,6 +41,10 @@ PROFILE ?= release
 CFLAGS_COMMON := -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
                  -D_GNU_SOURCE -fvisibility=hidden
 
+# Reproducible build stamp: derived from git so the same commit yields the
+# same binary. Override with DFP_BUILD_STAMP=... when building outside a tree.
+BUILD_STAMP ?= $(shell git describe --always --dirty --tags 2>/dev/null || echo unknown)
+
 ifeq ($(PROFILE),release)
     # Wide-compatibility baseline instead of -march=native. Native tuning makes
     # binaries that may crash on older CPUs (e.g. CRC32/SHA1/FP16 instructions).
@@ -50,14 +54,17 @@ ifeq ($(PROFILE),release)
                 -fno-plt -fno-exceptions -fomit-frame-pointer \
                 -ffunction-sections -fdata-sections \
                 -fmerge-all-constants -fno-semantic-interposition \
+                -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+                -DDFP_BUILD_STAMP="\"$(BUILD_STAMP)\"" \
                 $(CFLAGS_COMMON)
-    # Stack protector is intentionally enabled in release for safety.
-    # Disable only if you have measured it as a hot-path problem:
+    # Hardening in release: stack-protector-strong, FORTIFY_SOURCE=2, and
+    # full RELRO/NOW (below). Disable only if you measured a real regression:
     #   make PROFILE=release CFLAGS_EXTRA=-fno-stack-protector
-    LDFLAGS  := -flto -Wl,--gc-sections -Wl,-O1 -Wl,-z,noseparate-code -ldl
+    LDFLAGS  := -flto -Wl,--gc-sections -Wl,-O1 -Wl,-z,noseparate-code \
+                -Wl,-z,relro -Wl,-z,now -ldl
 else ifeq ($(PROFILE),debug)
     CFLAGS   := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer \
-                -DDEBUG $(CFLAGS_COMMON)
+                -DDEBUG -DDFP_BUILD_STAMP="\"$(BUILD_STAMP)\"" $(CFLAGS_COMMON)
     LDFLAGS  := -fsanitize=address,undefined -ldl
 else
     $(error Unknown PROFILE=$(PROFILE). Use "release" or "debug")

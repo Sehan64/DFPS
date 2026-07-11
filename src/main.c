@@ -191,6 +191,52 @@ bool consumeShutdownSignal(void) {
 }
 
 /* ================================================================== */
+/*  Fatal-signal handler (crash diagnostics)                           */
+/* ================================================================== */
+
+/* Best-effort backtrace on crash. execinfo.h is not universal (older NDK
+ * targets, some libcs), so guard on its presence; when unavailable we still
+ * log the signal number. The handler restricts itself to async-signal-safe
+ * primitives (write/raise/signal); backtrace* is best-effort and may be
+ * unavailable or partly unsafe, but a partial trace beats a silent death.
+ * Because PR_SET_DUMPABLE is 0 there is no core dump, so this stderr trace
+ * (or addresses, if the binary was stripped) is the only post-mortem we get
+ * before the supervisor respawns us. */
+#if defined(__has_include)
+#  if __has_include(<execinfo.h>)
+#    include <execinfo.h>
+#    define DFP_HAVE_BACKTRACE 1
+#  endif
+#endif
+
+static volatile sig_atomic_t s_fatal_seen = 0;
+
+__attribute__((cold))
+static void fatalSignalHandler(int sig, siginfo_t* info, void* ucontext) {
+    (void)info; (void)ucontext;
+    /* Re-entrancy guard: if we fault again while handling, just die. */
+    if (s_fatal_seen) _exit(128 + sig);
+    s_fatal_seen = 1;
+
+    static const char hdr[] = "\n[dfps] FATAL signal received — backtrace:\n";
+    (void)write(STDERR_FILENO, hdr, sizeof(hdr) - 1);
+
+#ifdef DFP_HAVE_BACKTRACE
+    void* frames[32];
+    int n = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+#else
+    static const char nobt[] = "(backtrace unavailable on this platform)\n";
+    (void)write(STDERR_FILENO, nobt, sizeof(nobt) - 1);
+#endif
+
+    /* Restore the default disposition and re-raise so the supervisor sees
+     * the real signal (and respawns a fresh instance). */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* ================================================================== */
 /*  Entry point                                                        */
 /* ================================================================== */
 
@@ -198,14 +244,24 @@ bool consumeShutdownSignal(void) {
 #define DFP_VERSION "1.0.0"
 #endif
 static const char* kDfpVersion = DFP_VERSION;
-static const char* kDfpBuild   = __DATE__ " " __TIME__;
+
+/* Build stamp is source-derived (git describe) so the same commit always
+ * yields the same binary. Override with -DDFP_BUILD_STAMP=... when building
+ * outside a git tree. Empty means "no stamp" (handled below). */
+#ifndef DFP_BUILD_STAMP
+#define DFP_BUILD_STAMP ""
+#endif
+static const char* kDfpBuild = DFP_BUILD_STAMP;
 
 int main(int argc, char** argv) {
     /* Version / help must work even when run unprivileged or before
      * any heavy setup, so handle it first. */
     if (argc > 1) {
         if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
-            printf("dfpsd %s (build %s)\n", kDfpVersion, kDfpBuild);
+            if (kDfpBuild[0])
+                printf("dfpsd %s (build %s)\n", kDfpVersion, kDfpBuild);
+            else
+                printf("dfpsd %s\n", kDfpVersion);
             return 0;
         }
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
@@ -285,6 +341,20 @@ int main(int argc, char** argv) {
     sigaddset(&mask, SIGWINCH);
     sigaddset(&mask, SIGPIPE);
     sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    /* Fatal-signal handlers: log a backtrace on a crash so the supervisor's
+     * respawn is not blind. Installed after PR_SET_DUMPABLE(0) so no core is
+     * produced; the stderr trace is the sole diagnostics. */
+    struct sigaction fa;
+    memset(&fa, 0, sizeof(fa));
+    fa.sa_sigaction = fatalSignalHandler;
+    fa.sa_flags = SA_SIGINFO;
+    sigemptyset(&fa.sa_mask);
+    sigaction(SIGSEGV, &fa, NULL);
+    sigaction(SIGABRT, &fa, NULL);
+    sigaction(SIGBUS,  &fa, NULL);
+    sigaction(SIGILL,  &fa, NULL);
+    sigaction(SIGFPE,  &fa, NULL);
 
     uid_t my_uid = getuid();
     g_root_mode = (my_uid == 0);

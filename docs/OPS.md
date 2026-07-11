@@ -23,11 +23,14 @@ su -c 'pkill -TERM -f /data/local/tmp/dfps/dfps'
 
 ```bash
 su -c '/data/local/tmp/dfps/dfps --version'
-# dfpsd 1.0.0 (build Jul 11 2026 19:04:12)
+# dfpsd 1.0.0 (build v1.0.0-3-gabcdef)
 ```
 
-The build stamp is compiled in (`__DATE__` / `__TIME__`), useful for
-confirming which binary is deployed on a device.
+The build stamp is the `git describe` of the source tree the binary was built
+from (e.g. `v1.0.0-3-gabcdef`, or `...-dirty` for a modified working tree), so
+the same commit always produces the same stamp — useful for confirming which
+binary is deployed on a device. Override at build time with
+`DFP_BUILD_STAMP=...`.
 
 ## Health check (STATUS)
 
