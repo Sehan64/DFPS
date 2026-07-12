@@ -136,6 +136,14 @@ test:
 >   src/main.c src/utils.c src/config.c src/rate.c \
 >   src/power.c src/touch.c tests/test_stubs.c -o bin/test_cfg -ldl -lpthread && \
 > $(SAN_ENV) ./bin/test_cfg && \
+> echo "Building regression test (sf_transact prepare-failure)..." && \
+> clang $(CFLAGS_COMMON) $(SAN_CFLAGS) -Dmain=dfps_main \
+>   -DDFPS_CONFIG_PATH="\"$$DFPS_TEST_DIR/dfps.conf\"" \
+>   -DDFPS_MODES_MAP_PATH="\"$$DFPS_TEST_DIR/modes.map\"" \
+>   tests/sf_transact_bug_test.c \
+>   src/main.c src/utils.c src/config.c src/rate.c \
+>   src/power.c src/touch.c tests/test_stubs.c -o bin/test_sf -ldl -lpthread && \
+> $(SAN_ENV) ./bin/test_sf && \
 > rm -rf "$$DFPS_TEST_DIR" && \
 > echo "ALL REGRESSION TESTS PASSED"
 
