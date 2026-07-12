@@ -170,7 +170,7 @@ void setRefreshRate(int32_t rate) {
     }
 }
 
-void updateRateState(void) {
+void updateRateState(uint64_t now) {
     bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
     int32_t target_rate = -1;
 
@@ -188,7 +188,6 @@ void updateRateState(void) {
     } else if (atomic_load_explicit(&g_min_brightness_clamp, memory_order_acquire)) {
         target_rate = (min_phys > 0) ? min_phys : def_idle;
     } else {
-        uint64_t now = getNowMs();
         uint64_t last_touch = atomic_load_explicit(&g_last_touch_time, memory_order_relaxed);
         bool touching = atomic_load_explicit(&g_touching, memory_order_relaxed);
         int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);

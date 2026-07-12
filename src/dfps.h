@@ -457,28 +457,47 @@ void rebuildRuleHash(void);
 void setSurfaceFlingerFrameRateFlex(bool enable);
 void invalidateRateModeCache(void);
 void setRefreshRate(int32_t rate);
-void updateRateState(void);
+/* `now` is CLOCK_MONOTONIC_COARSE ms from the caller's epoll iteration so the
+ * hot path does not issue a second clock_gettime. */
+void updateRateState(uint64_t now);
 void updateCurrentAppRates(const char* pkg);
 
 static inline int getPollTimeout(uint64_t now) {
-    /* When the IDisplayManager callback is registered, interactive and
-     * brightness changes arrive as events (via triggerPollerWakeup), so the
-     * loop can block until an event rather than polling. The only states
-     * with no callback — power-save mode and battery level — are driven
-     * by the maintenance timerfd. Block. */
-    if (atomic_load_explicit(&g_display_callback_active, memory_order_relaxed))
-        return -1;
-
+    /* Touch-slack (and touch-debounce) expiry must wake the loop even when
+     * the IDisplayManager callback is registered. Interactive/brightness are
+     * event-driven via that callback (and dirty bits), and power-save/battery
+     * ride the maintenance timerfd — but promoting a held contact past
+     * TOUCH_DEBOUNCE_MS and dropping active→idle after touchSlackMs have no
+     * other wake source. Do not short-circuit to -1 solely because
+     * g_display_callback_active is set.
+     *
+     * g_touch_down_since is touch-thread-only (same thread as the epoll loop
+     * that calls this helper), so a plain read is fine. */
     bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
     if (!interactive) return -1;
 
     bool touching = atomic_load_explicit(&g_touching, memory_order_relaxed);
-    if (touching) return -1;
+    if (touching) {
+        /* Effectively touching: block until an input/up event. */
+        return -1;
+    }
+
+    /* Raw contact held but not yet past TOUCH_DEBOUNCE_MS — wake to promote. */
+    if (g_touch_down_since != 0) {
+        uint64_t engage_at = g_touch_down_since + (uint64_t)TOUCH_DEBOUNCE_MS;
+        if (now < engage_at)
+            return (int)(engage_at - now);
+        return 0; /* debounce elapsed; loop must re-evaluate */
+    }
 
     uint64_t last_touch = atomic_load_explicit(&g_last_touch_time, memory_order_relaxed);
-    int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);
-    uint64_t expire = last_touch + (uint64_t)slack;
+    /* No touch observed yet (or state was cleared): nothing to expire. */
+    if (last_touch == 0) return -1;
 
+    int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);
+    if (slack <= 0) return -1;
+
+    uint64_t expire = last_touch + (uint64_t)slack;
     if (now < expire) {
         return (int)(expire - now);
     }
@@ -497,12 +516,18 @@ void queryFocusedTask(void);
 void resolveTransactionCodes(void);
 void onBinderDied(void* cookie);
 
-/* power.c */
+/* power.c
+ * check/evaluate helpers return true when a rate-relevant atomic changed so
+ * the epoll thread can set needs_rate_update without a nested eventfd write.
+ * Binder-pool callers of evaluateBatteryState must still wake the loop when
+ * the return is true. */
 int32_t readInitialBatteryLevel(void);
-void    checkInteractiveAndPowerSave(bool probe_interactive);
-void    checkMinBrightness(void);
-void    evaluateBatteryState(int32_t level);
-bool    handleUevent(void);
+bool    checkInteractiveAndPowerSave(bool probe_interactive);
+bool    checkMinBrightness(void);
+bool    evaluateBatteryState(int32_t level);
+/* Drains one uevent. Returns false when the socket is empty. Sets
+ * *state_changed when a battery evaluation mutated rate-relevant state. */
+bool    handleUevent(bool* state_changed);
 
 /* touch.c */
 bool  consumeShutdownSignal(void);

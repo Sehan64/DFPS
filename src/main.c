@@ -439,7 +439,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (g_cold.setThreadPoolMaxThreadCount) g_cold.setThreadPoolMaxThreadCount(0);
+    /* One dedicated binder pool thread is enough for our lightweight
+     * callbacks (observer / display / battery only set dirty bits + wake
+     * epoll). setThreadPoolMaxThreadCount(0) is ambiguous across NDK
+     * revisions ("no extra threads" vs "no pool at all") and can silently
+     * drop incoming callbacks; use 1 for predictable delivery. */
+    if (g_cold.setThreadPoolMaxThreadCount) g_cold.setThreadPoolMaxThreadCount(1);
     g_cold.startThreadPool();
     if (g_cold.DeathRecipient_new)
         g_cold.deathRecipient = g_cold.DeathRecipient_new(onBinderDied);
@@ -566,11 +571,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* Read initial battery state */
+    /* Read initial battery state (before the epoll thread is running — any
+     * rate-relevant transition is applied by the first updateRateState after
+     * the touch thread starts, so a wakeup is only needed if we already have
+     * a loop waiting. At this point we do not; queryFocusedTask later will
+     * also force a rate re-eval via needs_rate_update on the first wakeup.) */
     if (g_uevent_fd >= 0 || g_hot_binders.batteryPropertiesRegistrar) {
         int32_t initial_level = readInitialBatteryLevel();
-        evaluateBatteryState(initial_level);
-        triggerPollerWakeup();
+        (void)evaluateBatteryState(initial_level);
     }
 
     /* Spawn the touch / event-loop thread */
@@ -644,8 +652,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    checkInteractiveAndPowerSave(true);
-    checkMinBrightness();
+    (void)checkInteractiveAndPowerSave(true);
+    (void)checkMinBrightness();
 
     /* Register process observer for foreground app tracking */
     AIBinder_Class* obsClazz = g_cold.Class_define(

@@ -11,7 +11,7 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the Specific language governing permissions and
+ * See the License for the specific language governing permissions and
  * limitations under the License.
  */
 
@@ -20,6 +20,12 @@
  *
  * Monitors battery level via Binder and netlink uevent, tracks screen
  * brightness, and manages power-save / low-battery mode transitions.
+ *
+ * check/evaluate helpers return true when a rate-relevant atomic changed.
+ * Callers on the epoll thread use the return value to set needs_rate_update
+ * and avoid a nested eventfd write (which would force a second epoll_wait
+ * round-trip). Binder-pool callers still wake the loop when the return is
+ * true.
  */
 
 #include "dfps.h"
@@ -28,24 +34,32 @@
 /*  Battery level (sysfs fallback)                                     */
 /* ================================================================== */
 
+/* Cached supply name + full capacity path so the hot path is one open/read
+ * instead of opendir + type probe + fopen(stdio). */
 static char s_battery_supply_name[64] = {0};
+static char s_battery_capacity_path[128] = {0};
+
+static int32_t readCapacityAt(const char* path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char buf[16];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    char* end = NULL;
+    long val = strtol(buf, &end, 10);
+    if (end == buf || val < 0 || val > 100) return -1;
+    return (int32_t)val;
+}
 
 int32_t readInitialBatteryLevel(void) {
-    /* Fast path: if we already know the battery supply name, read it directly. */
-    if (s_battery_supply_name[0] != '\0') {
-        char path[128];
-        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/capacity",
-                 s_battery_supply_name);
-        FILE* f = fopen(path, "r");
-        if (f) {
-            int level = 100;
-            if (fscanf(f, "%d", &level) == 1 && level >= 0 && level <= 100) {
-                fclose(f);
-                return level;
-            }
-            fclose(f);
-        }
-        /* Fall through to re-scan if the cached path stopped working. */
+    /* Fast path: known capacity path — single open/read. */
+    if (s_battery_capacity_path[0] != '\0') {
+        int32_t level = readCapacityAt(s_battery_capacity_path);
+        if (level >= 0) return level;
+        /* Cached path went stale — rescan. */
+        s_battery_capacity_path[0] = '\0';
         s_battery_supply_name[0] = '\0';
     }
 
@@ -54,37 +68,32 @@ int32_t readInitialBatteryLevel(void) {
 
     struct dirent* entry;
     int level = 100;
-    char name_buf[256] = {0};
+    char name_buf[256];
 
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
 
         snprintf(name_buf, sizeof(name_buf),
                  "/sys/class/power_supply/%s/type", entry->d_name);
-        FILE* f = fopen(name_buf, "r");
-        if (f) {
-            char type[32] = {0};
-            if (fgets(type, sizeof(type), f)) {
-                size_t nl = strcspn(type, "\n");
-                if (nl < sizeof(type)) type[nl] = '\0';
-                if (strcmp(type, "Battery") == 0) {
-                    fclose(f);
-                    strlcpy(s_battery_supply_name, entry->d_name,
-                            sizeof(s_battery_supply_name));
-                    snprintf(name_buf, sizeof(name_buf),
-                             "/sys/class/power_supply/%s/capacity",
-                             entry->d_name);
-                    FILE* cf = fopen(name_buf, "r");
-                    if (cf) {
-                        if (fscanf(cf, "%d", &level) != 1) level = 100;
-                        fclose(cf);
-                    }
-                    closedir(dir);
-                    return level;
-                }
-            }
-            fclose(f);
-        }
+        int tfd = open(name_buf, O_RDONLY | O_CLOEXEC);
+        if (tfd < 0) continue;
+        char type[32] = {0};
+        ssize_t tn = read(tfd, type, sizeof(type) - 1);
+        close(tfd);
+        if (tn <= 0) continue;
+        type[tn] = '\0';
+        size_t nl = strcspn(type, "\n\r");
+        type[nl] = '\0';
+        if (strcmp(type, "Battery") != 0) continue;
+
+        strlcpy(s_battery_supply_name, entry->d_name,
+                sizeof(s_battery_supply_name));
+        snprintf(s_battery_capacity_path, sizeof(s_battery_capacity_path),
+                 "/sys/class/power_supply/%s/capacity", entry->d_name);
+        int32_t got = readCapacityAt(s_battery_capacity_path);
+        if (got >= 0) level = got;
+        closedir(dir);
+        return level;
     }
     closedir(dir);
     return level;
@@ -94,8 +103,9 @@ int32_t readInitialBatteryLevel(void) {
 /*  Interactive / power-save state queries (Binder)                    */
 /* ================================================================== */
 
-void checkInteractiveAndPowerSave(bool probe_interactive) {
-    if (!g_hot_binders.powerManager) return;
+bool checkInteractiveAndPowerSave(bool probe_interactive) {
+    bool changed = false;
+    if (!g_hot_binders.powerManager) return false;
 
     /* Query isInteractive.
      * When the IDisplayManager callback is registered, interactive-state
@@ -123,7 +133,7 @@ void checkInteractiveAndPowerSave(bool probe_interactive) {
                                   interactive ? "ON" : "OFF");
                             atomic_store_explicit(&g_screen_interactive, interactive,
                                                    memory_order_release);
-                            triggerPollerWakeup();
+                            changed = true;
                         }
                     }
                 }
@@ -153,7 +163,7 @@ void checkInteractiveAndPowerSave(bool probe_interactive) {
                                  power_save ? "ON" : "OFF");
                             atomic_store_explicit(&g_power_save_mode, power_save,
                                                    memory_order_release);
-                            triggerPollerWakeup();
+                            changed = true;
                         }
                     }
                 }
@@ -161,22 +171,23 @@ void checkInteractiveAndPowerSave(bool probe_interactive) {
             }
         }
     }
+    return changed;
 }
 
 /* ================================================================== */
 /*  Brightness clamping                                                */
 /* ================================================================== */
 
-void checkMinBrightness(void) {
+bool checkMinBrightness(void) {
     if (!atomic_load_explicit(&g_enable_min_brightness, memory_order_relaxed) ||
         !g_hot_binders.displayManager ||
         g_hot_ops.resolvedGetBrightnessCode == 0) {
-        return;
+        return false;
     }
 
     AParcel* in_b = NULL;
     if (g_hot_ops.prepareTransaction(g_hot_binders.displayManager, &in_b) != STATUS_OK || !in_b)
-        return;
+        return false;
 
     g_hot_ops.writeInt32(in_b, 0); /* displayId = 0 */
     AParcel* reply_b = NULL;
@@ -185,9 +196,10 @@ void checkMinBrightness(void) {
         g_hot_ops.resolvedGetBrightnessCode, &in_b, &reply_b, 0);
     if (status_b != STATUS_OK || !reply_b) {
         if (reply_b) g_hot_ops.deleteParcel(reply_b);
-        return;
+        return false;
     }
 
+    bool changed = false;
     int32_t exception_b = -1;
     if (g_hot_ops.readInt32(reply_b, &exception_b) == STATUS_OK && exception_b == 0) {
         float brightness = 1.0f;
@@ -203,21 +215,22 @@ void checkMinBrightness(void) {
                          new_min_bright ? "ON" : "OFF", brightness, threshold);
                     atomic_store_explicit(&g_min_brightness_clamp, new_min_bright,
                                            memory_order_release);
-                    triggerPollerWakeup();
+                    changed = true;
                 }
             }
         }
     }
     g_hot_ops.deleteParcel(reply_b);
+    return changed;
 }
 
 /* ================================================================== */
 /*  Battery state evaluation                                           */
 /* ================================================================== */
 
-void evaluateBatteryState(int32_t level) {
+bool evaluateBatteryState(int32_t level) {
     bool batt_saver_on = atomic_load_explicit(&g_battery_saver, memory_order_relaxed);
-    if (!batt_saver_on) return;
+    if (!batt_saver_on) return false;
 
     int32_t old_level = atomic_exchange_explicit(&g_battery_level, level,
                                                   memory_order_relaxed);
@@ -245,18 +258,21 @@ void evaluateBatteryState(int32_t level) {
                 &g_low_battery_mode, &current_low_batt, new_low_batt,
                 memory_order_release, memory_order_acquire)) {
             LOGI("Low battery mode: %s", new_low_batt ? "ON" : "OFF");
-            triggerPollerWakeup();
+            return true;
         }
         /* If CAS failed, another thread already updated the value;
-         * the winning thread's triggerPollerWakeup() handles the state change. */
+         * the winning thread reports the change. */
     }
+    return false;
 }
 
 /* ================================================================== */
 /*  Netlink uevent handler                                             */
 /* ================================================================== */
 
-bool handleUevent(void) {
+bool handleUevent(bool* state_changed) {
+    if (state_changed) *state_changed = false;
+
     char buf[8192];
     ssize_t len = recv(g_uevent_fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
     if (len <= 0) return false;
@@ -299,7 +315,8 @@ bool handleUevent(void) {
                 return true; /* Different supply — ignore. */
             }
         }
-        evaluateBatteryState(new_level);
+        bool changed = evaluateBatteryState(new_level);
+        if (state_changed) *state_changed = changed;
     }
     return true;
 }
