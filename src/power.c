@@ -116,6 +116,41 @@ static bool read_pm_bool_reply(AParcel* reply, bool* out) {
     return true;
 }
 
+static void log_interactive_change(bool v) {
+    LOGI("Interactive screen state changed: screen is now %s", v ? "ON" : "OFF");
+}
+
+static void log_powersave_change(bool v) {
+    LOGI("System Power save mode changed: %s", v ? "ON" : "OFF");
+}
+
+/* One PowerManager boolean query. On a successfully-parsed reply whose value
+ * differs from *flag, store it (caller-supplied load/store orders) and invoke
+ * on_change for logging. Returns true iff the reply was parsed. */
+static bool pm_query_bool(uint32_t code, _Atomic bool* flag,
+                          memory_order load_order, memory_order store_order,
+                          void (*on_change)(bool), bool* changed) {
+    AParcel* in = NULL;
+    if (g_hot_ops.prepareTransaction(g_hot_binders.powerManager, &in) != STATUS_OK || !in)
+        return false;
+    AParcel* reply = NULL;
+    binder_status_t status = g_hot_ops.transact(g_hot_binders.powerManager,
+                                                 code, &in, &reply, 0);
+    if (status != STATUS_OK || !reply) {
+        if (reply) g_hot_ops.deleteParcel(reply);
+        return false;
+    }
+    bool v = false;
+    bool ok = read_pm_bool_reply(reply, &v);
+    g_hot_ops.deleteParcel(reply);
+    if (ok && v != atomic_load_explicit(flag, load_order)) {
+        atomic_store_explicit(flag, v, store_order);
+        if (on_change) on_change(v);
+        *changed = true;
+    }
+    return ok;
+}
+
 bool checkInteractiveAndPowerSave(bool probe_interactive) {
     bool changed = false;
     if (!g_hot_binders.powerManager) return false;
@@ -128,53 +163,17 @@ bool checkInteractiveAndPowerSave(bool probe_interactive) {
      * callback does not deliver power-save-mode transitions, so skipping it
      * would leave g_power_save_mode stale and defeat the power-save cap. */
     if (probe_interactive) {
-        AParcel* in = NULL;
-        if (g_hot_ops.prepareTransaction(g_hot_binders.powerManager, &in) == STATUS_OK && in) {
-            AParcel* reply = NULL;
-            binder_status_t status = g_hot_ops.transact(
-                g_hot_binders.powerManager,
-                g_hot_ops.resolvedIsInteractiveCode, &in, &reply, 0);
-            if (status == STATUS_OK && reply) {
-                bool interactive = false;
-                if (read_pm_bool_reply(reply, &interactive)) {
-                    if (interactive != atomic_load_explicit(&g_screen_interactive,
-                                                             memory_order_relaxed)) {
-                        LOGI("Interactive screen state changed: screen is now %s",
-                              interactive ? "ON" : "OFF");
-                        atomic_store_explicit(&g_screen_interactive, interactive,
-                                               memory_order_release);
-                        changed = true;
-                    }
-                }
-                g_hot_ops.deleteParcel(reply);
-            }
-        }
+        pm_query_bool(g_hot_ops.resolvedIsInteractiveCode, &g_screen_interactive,
+                      memory_order_relaxed, memory_order_release,
+                      log_interactive_change, &changed);
     }
 
     /* Query isPowerSaveMode — always probe (see note above). */
     if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed) &&
         g_hot_ops.resolvedIsPowerSaveModeCode != 0) {
-        AParcel* in2 = NULL;
-        if (g_hot_ops.prepareTransaction(g_hot_binders.powerManager, &in2) == STATUS_OK && in2) {
-            AParcel* reply2 = NULL;
-            binder_status_t status = g_hot_ops.transact(
-                g_hot_binders.powerManager,
-                g_hot_ops.resolvedIsPowerSaveModeCode, &in2, &reply2, 0);
-            if (status == STATUS_OK && reply2) {
-                bool power_save = false;
-                if (read_pm_bool_reply(reply2, &power_save)) {
-                    if (power_save != atomic_load_explicit(&g_power_save_mode,
-                                                            memory_order_relaxed)) {
-                        LOGI("System Power save mode changed: %s",
-                             power_save ? "ON" : "OFF");
-                        atomic_store_explicit(&g_power_save_mode, power_save,
-                                               memory_order_release);
-                        changed = true;
-                    }
-                }
-                g_hot_ops.deleteParcel(reply2);
-            }
-        }
+        pm_query_bool(g_hot_ops.resolvedIsPowerSaveModeCode, &g_power_save_mode,
+                      memory_order_acquire, memory_order_release,
+                      log_powersave_change, &changed);
     }
     return changed;
 }
