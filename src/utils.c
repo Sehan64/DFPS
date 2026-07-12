@@ -55,8 +55,47 @@ void writeLog(int level, const char* fmt, ...) {
 /*  Abstract socket server                                             */
 /* ================================================================== */
 
+/* Ensure the runtime directory exists and is not group/other-writable.
+ * Returns true if the directory is usable (exists or was created). A
+ * world-writable dir is still usable but logs a warning — Magisk modules
+ * often live under /data/local/tmp which starts 0777 on many devices. */
+__attribute__((cold))
+static bool ensureRuntimeDir(const char* dir) {
+    struct stat st;
+    if (stat(dir, &st) != 0) {
+        if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+            LOGE("Failed to create runtime directory %s: %s", dir, strerror(errno));
+            return false;
+        }
+        if (stat(dir, &st) != 0) {
+            LOGE("Runtime directory %s missing after mkdir: %s", dir, strerror(errno));
+            return false;
+        }
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        LOGE("Runtime path %s is not a directory.", dir);
+        return false;
+    }
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        LOGW("Runtime directory %s is group/other-writable (mode %04o). "
+             "Any local app can rewrite dfps.conf / modes.map. "
+             "Prefer chmod 700 and chown root:root.",
+             dir, (unsigned)(st.st_mode & 0777));
+        /* Best-effort tighten when we own the dir (root). */
+        if (geteuid() == 0) {
+            if (chmod(dir, 0700) == 0) {
+                LOGI("Tightened %s to mode 0700.", dir);
+            }
+        }
+    }
+    return true;
+}
+
 __attribute__((cold))
 bool setupAbstractSocket(void) {
+    /* Config, modes map, tx cache, and the resolver JAR all live here. */
+    (void)ensureRuntimeDir("/data/local/tmp/dfps");
+
     g_server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (g_server_fd < 0) {
         LOGE("Failed to create abstract socket descriptor.");
