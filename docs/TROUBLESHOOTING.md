@@ -34,7 +34,10 @@ next start.
    (`dumpsys SurfaceFlinger` / display modes).
 2. `STATUS` shows expected `idle`/`active` and a changing `last`.
 3. Touch path: root, devices registered in log, screen interactive, hold
-   longer than 50 ms debounce, wait out `touchSlackMs` for idle drop.
+   longer than 80 ms debounce, wait out `touchSlackMs` for idle drop.
+   If the rate thrashs 60↔90 while idle, check for phantom MT contacts in
+   logcat (`DEBUG=true`) and that PowerManager/DisplayManager prepareTransaction
+   no longer logs “Class is not set”.
 4. Overrides: `minbright=1` or `powersave`/`lowbatt=1` with a low cap.
 5. OEM may ignore SF tx `1035` — try `enableFrameRateFlex = true` for `1036`.
 

@@ -62,8 +62,13 @@ Priority order:
 `setRefreshRate` skips the Binder call when the target equals `g_last_set_rate`.
 Hz maps through `modes.map` (exact, then closest within 30 Hz).
 
-Touch contacts must last **`TOUCH_DEBOUNCE_MS` (50)** before engaging active
+Touch contacts must last **`TOUCH_DEBOUNCE_MS` (80)** before engaging active
 rate. Multi-device contacts are OR’d so dual digitizers do not clear each other.
+
+Idle drop is **one-shot**: `g_idle_drop_armed` is set only on contact end and
+cleared after a settled idle apply. Netlink `recvfrom` (charger uevents) must
+not re-drive rate control — that was the thrash root cause when the loop
+parked on `epoll_pwait(-1)` and only uevents woke it.
 
 ## Hot-path rules
 

@@ -23,7 +23,7 @@ After the last touch, keep the **active** rate for this many milliseconds
 before dropping to idle. Avoids thrashing the panel on short gestures.
 
 - Valid range `0`–`60000`; out-of-range values fall back to `4000`.
-- Contacts shorter than 50 ms (hard-coded debounce) never engage active rate,
+- Contacts shorter than 80 ms (hard-coded debounce) never engage active rate,
   so phantom multitouch noise does not ramp the panel.
 
 ### `enableMinBrightness` / `minBrightnessThreshold`
