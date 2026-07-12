@@ -49,8 +49,19 @@ void loadModesMap(void) {
     const char* map_path = DFPS_MODES_MAP_PATH;
     FILE* f = fopen(map_path, "r");
     if (!f) {
-        LOGE("modes.map missing at %s; clearing cached mode map to defaults.",
-             map_path);
+        /* Keep the previous map if we already have one. Wiping it on a
+         * transient delete freezes rate control (setRefreshRate cannot map
+         * Hz → SF id) while the daemon keeps running. First boot with no
+         * file still ends up with an empty map and logs the error. */
+        pthread_rwlock_rdlock(&g_config_lock);
+        int existing = g_mode_count;
+        pthread_rwlock_unlock(&g_config_lock);
+        if (existing > 0) {
+            LOGE("modes.map missing at %s; keeping %d previously loaded mapping(s).",
+                 map_path, existing);
+            return;
+        }
+        LOGE("modes.map missing at %s; no prior map to keep.", map_path);
     }
 
     ModeMapEntry temp_modes[MAX_MODES];
@@ -101,6 +112,18 @@ void loadModesMap(void) {
             }
         }
         fclose(f);
+    }
+
+    /* Empty/malformed file after a successful prior load: keep the old map. */
+    if (temp_mode_count == 0) {
+        pthread_rwlock_rdlock(&g_config_lock);
+        int existing = g_mode_count;
+        pthread_rwlock_unlock(&g_config_lock);
+        if (existing > 0) {
+            LOGW("modes.map produced 0 valid entries; keeping %d previously loaded mapping(s).",
+                 existing);
+            return;
+        }
     }
 
     /* Commit under write lock — consistent with loadConfig */
@@ -163,6 +186,9 @@ static bool parse_int32(const char* s, int32_t* out) {
     errno = 0;
     long v = strtol(s, &endptr, 10);
     if (endptr == s || *endptr != '\0' || errno == ERANGE) return false;
+    /* Reject values that would truncate when stored in int32_t. strtol only
+     * sets ERANGE for long overflow, which is wider than int32 on LP64. */
+    if (v < (long)INT32_MIN || v > (long)INT32_MAX) return false;
     *out = (int32_t)v;
     return true;
 }
