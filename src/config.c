@@ -193,6 +193,79 @@ static bool parse_int32(const char* s, int32_t* out) {
     return true;
 }
 
+/* Trim trailing ASCII whitespace in place. */
+__attribute__((cold, always_inline))
+static inline void trim_trailing_ws(char* s) {
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1]))
+        s[--len] = '\0';
+}
+
+/* Stack staging for one loadConfig pass. Defaults match historical behavior. */
+typedef struct {
+    int32_t offscreen_rate;
+    int32_t default_idle;
+    int32_t default_active;
+    int32_t slack;
+    bool    frame_rate_flex;
+    bool    min_bright;
+    int32_t min_bright_threshold;
+    bool    debug;
+    bool    battery_saver;
+    int32_t low_battery_threshold;
+    int32_t power_save_max_rate;
+} TempConfig;
+
+typedef enum {
+    CFG_BOOL_TRUE, /* only "true"/"1" set the field; other values leave default */
+    CFG_INT32
+} CfgValueKind;
+
+typedef struct {
+    const char*  key;
+    CfgValueKind kind;
+    size_t       offset; /* offsetof(TempConfig, field) */
+} CfgKeyEntry;
+
+#define CFG_OFF(field) offsetof(TempConfig, field)
+
+static const CfgKeyEntry k_cfg_keys[] = {
+    { "DEBUG",                  CFG_BOOL_TRUE, CFG_OFF(debug) },
+    { "touchSlackMs",           CFG_INT32,     CFG_OFF(slack) },
+    { "enableFrameRateFlex",    CFG_BOOL_TRUE, CFG_OFF(frame_rate_flex) },
+    { "enableMinBrightness",    CFG_BOOL_TRUE, CFG_OFF(min_bright) },
+    { "minBrightnessThreshold", CFG_INT32,     CFG_OFF(min_bright_threshold) },
+    { "defaultIdle",            CFG_INT32,     CFG_OFF(default_idle) },
+    { "defaultActive",          CFG_INT32,     CFG_OFF(default_active) },
+    { "offscreenRate",          CFG_INT32,     CFG_OFF(offscreen_rate) },
+    { "batterySaver",           CFG_BOOL_TRUE, CFG_OFF(battery_saver) },
+    { "lowBatteryThreshold",    CFG_INT32,     CFG_OFF(low_battery_threshold) },
+    { "powerSaveMaxRate",       CFG_INT32,     CFG_OFF(power_save_max_rate) },
+};
+
+/* Apply one known scalar key. Returns true if key matched a table entry. */
+__attribute__((cold))
+static bool apply_config_key(TempConfig* cfg, const char* key, const char* val) {
+    for (size_t i = 0; i < sizeof(k_cfg_keys) / sizeof(k_cfg_keys[0]); i++) {
+        if (strcasecmp(key, k_cfg_keys[i].key) != 0) continue;
+        void* field = (char*)cfg + k_cfg_keys[i].offset;
+        if (k_cfg_keys[i].kind == CFG_BOOL_TRUE) {
+            if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                *(bool*)field = true;
+        } else {
+            int32_t v;
+            if (parse_int32(val, &v)) {
+                *(int32_t*)field = v;
+            } else {
+                LOGE("dfps.conf: invalid %s '%s', using default %d",
+                     k_cfg_keys[i].key, val, *(int32_t*)field);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 void loadConfig(void) {
     const char* config_path = DFPS_CONFIG_PATH;
     FILE* f = fopen(config_path, "r");
@@ -203,18 +276,19 @@ void loadConfig(void) {
 
     PerAppRule temp_rules[MAX_RULES];
     int temp_rule_count = 0;
-    int32_t temp_offscreen_rate = -1;
-    int32_t temp_default_idle = 60;
-    int32_t temp_default_active = 120;
-    int32_t temp_slack = 4000;
-    bool temp_frame_rate_flex = false;
-    bool temp_min_bright = false;
-    int32_t temp_min_bright_threshold = 0;
-    bool temp_debug = false;
-
-    bool temp_battery_saver = false;
-    int32_t temp_low_battery_threshold = 10;
-    int32_t temp_power_save_max_rate = 60;
+    TempConfig temp = {
+        .offscreen_rate = -1,
+        .default_idle = 60,
+        .default_active = 120,
+        .slack = 4000,
+        .frame_rate_flex = false,
+        .min_bright = false,
+        .min_bright_threshold = 0,
+        .debug = false,
+        .battery_saver = false,
+        .low_battery_threshold = 10,
+        .power_save_max_rate = 60,
+    };
 
     char line[256];
     int line_num = 0;
@@ -224,88 +298,46 @@ void loadConfig(void) {
             char* hash = strchr(line, '#');
             if (hash) *hash = '\0';
 
-            int len = (int)strlen(line);
-            while (len > 0 && isspace((unsigned char)line[len-1])) {
-                line[--len] = '\0';
-            }
-            if (len == 0) continue;
+            trim_trailing_ws(line);
+            if (line[0] == '\0') continue;
 
             char* eq = strchr(line, '=');
             if (!eq) continue;
 
             *eq = '\0';
-            char* key = line;
-            char* val = eq + 1;
-
-            key = skip_leading_ws(key);
+            char* key = skip_leading_ws(line);
             if (*key == '\0') continue;
-            char* key_end = key + strlen(key) - 1;
-            while (key_end > key && isspace((unsigned char)*key_end)) *key_end-- = '\0';
-            while (isspace((unsigned char)*val)) val++;
+            trim_trailing_ws(key);
+
+            char* val = skip_leading_ws(eq + 1);
             /* Trim trailing whitespace so a value like "key = 45  " (with a
              * trailing space, as written by some editors) is accepted by the
              * strict parser below instead of being flagged as garbage. */
-            {
-                size_t vlen = strlen(val);
-                while (vlen > 0 && isspace((unsigned char)val[vlen - 1]))
-                    val[--vlen] = '\0';
-            }
+            trim_trailing_ws(val);
 
-            if (strcasecmp(key, "DEBUG") == 0) {
-                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                    temp_debug = true;
-            } else if (strcasecmp(key, "touchSlackMs") == 0) {
-                int32_t v; if (parse_int32(val, &v)) temp_slack = v;
-                else LOGE("dfps.conf: invalid touchSlackMs '%s', using default %d", val, temp_slack);
-            } else if (strcasecmp(key, "enableFrameRateFlex") == 0) {
-                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                    temp_frame_rate_flex = true;
-            } else if (strcasecmp(key, "enableMinBrightness") == 0) {
-                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                    temp_min_bright = true;
-            } else if (strcasecmp(key, "minBrightnessThreshold") == 0) {
-                int32_t v; if (parse_int32(val, &v)) temp_min_bright_threshold = v;
-                else LOGE("dfps.conf: invalid minBrightnessThreshold '%s', using default %d", val, temp_min_bright_threshold);
-            } else if (strcasecmp(key, "defaultIdle") == 0) {
-                int32_t v; if (parse_int32(val, &v)) temp_default_idle = v;
-                else LOGE("dfps.conf: invalid defaultIdle '%s', using default %d", val, temp_default_idle);
-            } else if (strcasecmp(key, "defaultActive") == 0) {
-                int32_t v; if (parse_int32(val, &v)) temp_default_active = v;
-                else LOGE("dfps.conf: invalid defaultActive '%s', using default %d", val, temp_default_active);
-            } else if (strcasecmp(key, "offscreenRate") == 0) {
-                int32_t v; if (parse_int32(val, &v)) temp_offscreen_rate = v;
-                else LOGE("dfps.conf: invalid offscreenRate '%s', using default %d", val, temp_offscreen_rate);
-            } else if (strcasecmp(key, "batterySaver") == 0) {
-                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
-                    temp_battery_saver = true;
-            } else if (strcasecmp(key, "lowBatteryThreshold") == 0) {
-                int32_t v; if (parse_int32(val, &v)) temp_low_battery_threshold = v;
-                else LOGE("dfps.conf: invalid lowBatteryThreshold '%s', using default %d", val, temp_low_battery_threshold);
-            } else if (strcasecmp(key, "powerSaveMaxRate") == 0) {
-                int32_t v; if (parse_int32(val, &v)) temp_power_save_max_rate = v;
-                else LOGE("dfps.conf: invalid powerSaveMaxRate '%s', using default %d", val, temp_power_save_max_rate);
-            } else {
-                /* Per-app rule: "PackageName = idle active" */
-                int idle = -1, active = -1;
-                if (sscanf(val, "%d %d", &idle, &active) == 2) {
-                    bool valid = true;
-                    if (idle != -1 && (idle <= 0 || idle > 1000)) {
-                        LOGW("dfps.conf line %d: rejected absurd idle rate %d for '%s'",
-                             line_num, idle, key);
-                        valid = false;
-                    }
-                    if (active != -1 && (active <= 0 || active > 1000)) {
-                        LOGW("dfps.conf line %d: rejected absurd active rate %d for '%s'",
-                             line_num, active, key);
-                        valid = false;
-                    }
-                    if (valid && temp_rule_count < MAX_RULES) {
-                        strlcpy(temp_rules[temp_rule_count].pkg, key,
-                                sizeof(temp_rules[0].pkg));
-                        temp_rules[temp_rule_count].idle = idle;
-                        temp_rules[temp_rule_count].active = active;
-                        temp_rule_count++;
-                    }
+            if (apply_config_key(&temp, key, val))
+                continue;
+
+            /* Per-app rule: "PackageName = idle active" */
+            int idle = -1, active = -1;
+            if (sscanf(val, "%d %d", &idle, &active) == 2) {
+                bool valid = true;
+                if (idle != -1 && (idle <= 0 || idle > 1000)) {
+                    LOGW("dfps.conf line %d: rejected absurd idle rate %d for '%s'",
+                         line_num, idle, key);
+                    valid = false;
+                }
+                if (active != -1 && (active <= 0 || active > 1000)) {
+                    LOGW("dfps.conf line %d: rejected absurd active rate %d for '%s'",
+                         line_num, active, key);
+                    valid = false;
+                }
+                if (valid && temp_rule_count < MAX_RULES) {
+                    strlcpy(temp_rules[temp_rule_count].pkg, key,
+                            sizeof(temp_rules[0].pkg));
+                    temp_rules[temp_rule_count].idle = idle;
+                    temp_rules[temp_rule_count].active = active;
+                    temp_rule_count++;
                 }
             }
         }
@@ -313,50 +345,50 @@ void loadConfig(void) {
     }
 
     /* Validate accumulated values */
-    if (temp_slack < 0 || temp_slack > 60000) {
-        LOGW("dfps.conf: rejected absurd touchSlackMs %d, using 4000", temp_slack);
-        temp_slack = 4000;
+    if (temp.slack < 0 || temp.slack > 60000) {
+        LOGW("dfps.conf: rejected absurd touchSlackMs %d, using 4000", temp.slack);
+        temp.slack = 4000;
     }
-    if (temp_default_idle <= 0 || temp_default_idle > 1000) {
-        LOGW("dfps.conf: rejected absurd defaultIdle %d, using 60", temp_default_idle);
-        temp_default_idle = 60;
+    if (temp.default_idle <= 0 || temp.default_idle > 1000) {
+        LOGW("dfps.conf: rejected absurd defaultIdle %d, using 60", temp.default_idle);
+        temp.default_idle = 60;
     }
-    if (temp_default_active <= 0 || temp_default_active > 1000) {
-        LOGW("dfps.conf: rejected absurd defaultActive %d, using 120", temp_default_active);
-        temp_default_active = 120;
+    if (temp.default_active <= 0 || temp.default_active > 1000) {
+        LOGW("dfps.conf: rejected absurd defaultActive %d, using 120", temp.default_active);
+        temp.default_active = 120;
     }
-    if (temp_offscreen_rate != -1 &&
-        (temp_offscreen_rate <= 0 || temp_offscreen_rate > 1000)) {
-        LOGW("dfps.conf: rejected absurd offscreenRate %d, using -1", temp_offscreen_rate);
-        temp_offscreen_rate = -1;
+    if (temp.offscreen_rate != -1 &&
+        (temp.offscreen_rate <= 0 || temp.offscreen_rate > 1000)) {
+        LOGW("dfps.conf: rejected absurd offscreenRate %d, using -1", temp.offscreen_rate);
+        temp.offscreen_rate = -1;
     }
-    if (temp_power_save_max_rate <= 0 || temp_power_save_max_rate > 1000) {
+    if (temp.power_save_max_rate <= 0 || temp.power_save_max_rate > 1000) {
         LOGW("dfps.conf: rejected absurd powerSaveMaxRate %d, using 60",
-             temp_power_save_max_rate);
-        temp_power_save_max_rate = 60;
+             temp.power_save_max_rate);
+        temp.power_save_max_rate = 60;
     }
-    if (temp_low_battery_threshold < 0 || temp_low_battery_threshold > 100) {
+    if (temp.low_battery_threshold < 0 || temp.low_battery_threshold > 100) {
         LOGW("dfps.conf: rejected absurd lowBatteryThreshold %d, using 10",
-             temp_low_battery_threshold);
-        temp_low_battery_threshold = 10;
+             temp.low_battery_threshold);
+        temp.low_battery_threshold = 10;
     }
-    if (temp_min_bright_threshold < 0 || temp_min_bright_threshold > 100) {
+    if (temp.min_bright_threshold < 0 || temp.min_bright_threshold > 100) {
         LOGW("dfps.conf: rejected absurd minBrightnessThreshold %d, using 0",
-             temp_min_bright_threshold);
-        temp_min_bright_threshold = 0;
+             temp.min_bright_threshold);
+        temp.min_bright_threshold = 0;
     }
 
-    if (!temp_battery_saver &&
-        (temp_low_battery_threshold != 10 || temp_power_save_max_rate != 60)) {
+    if (!temp.battery_saver &&
+        (temp.low_battery_threshold != 10 || temp.power_save_max_rate != 60)) {
         LOGW("dfps.conf: batterySaver=false, so lowBatteryThreshold and "
              "powerSaveMaxRate have no effect until batterySaver=true.");
     }
 
-    atomic_store(&g_debug, temp_debug);
+    atomic_store(&g_debug, temp.debug);
     bool old_frame_rate_flex = atomic_exchange_explicit(
-        &g_enable_frame_rate_flex, temp_frame_rate_flex, memory_order_acq_rel);
-    if (old_frame_rate_flex != temp_frame_rate_flex && g_hot_binders.surfaceFlinger) {
-        setSurfaceFlingerFrameRateFlex(temp_frame_rate_flex);
+        &g_enable_frame_rate_flex, temp.frame_rate_flex, memory_order_acq_rel);
+    if (old_frame_rate_flex != temp.frame_rate_flex && g_hot_binders.surfaceFlinger) {
+        setSurfaceFlingerFrameRateFlex(temp.frame_rate_flex);
     }
 
     /* Commit parsed config under write lock */
@@ -365,37 +397,37 @@ void loadConfig(void) {
     if (temp_rule_count > 0) {
         memcpy(g_rules, temp_rules, sizeof(PerAppRule) * temp_rule_count);
     }
-    atomic_store_explicit(&g_offscreen_rate, temp_offscreen_rate, memory_order_release);
-    atomic_store_explicit(&g_default_idle_rate, temp_default_idle, memory_order_release);
-    atomic_store_explicit(&g_default_active_rate, temp_default_active, memory_order_release);
+    atomic_store_explicit(&g_offscreen_rate, temp.offscreen_rate, memory_order_release);
+    atomic_store_explicit(&g_default_idle_rate, temp.default_idle, memory_order_release);
+    atomic_store_explicit(&g_default_active_rate, temp.default_active, memory_order_release);
     rebuildRuleHash();
     pthread_rwlock_unlock(&g_config_lock);
 
-    atomic_store_explicit(&g_touch_slack_ms, temp_slack, memory_order_release);
+    atomic_store_explicit(&g_touch_slack_ms, temp.slack, memory_order_release);
     bool old_min_bright = atomic_exchange_explicit(
-        &g_enable_min_brightness, temp_min_bright, memory_order_acq_rel);
-    if (old_min_bright && !temp_min_bright) {
+        &g_enable_min_brightness, temp.min_bright, memory_order_acq_rel);
+    if (old_min_bright && !temp.min_bright) {
         atomic_store_explicit(&g_min_brightness_clamp, false, memory_order_release);
     }
-    atomic_store_explicit(&g_min_brightness_threshold, temp_min_bright_threshold, memory_order_release);
+    atomic_store_explicit(&g_min_brightness_threshold, temp.min_bright_threshold, memory_order_release);
     bool old_battery_saver = atomic_exchange_explicit(
-        &g_battery_saver, temp_battery_saver, memory_order_acq_rel);
-    if (old_battery_saver && !temp_battery_saver) {
+        &g_battery_saver, temp.battery_saver, memory_order_acq_rel);
+    if (old_battery_saver && !temp.battery_saver) {
         atomic_store_explicit(&g_power_save_mode, false, memory_order_release);
         atomic_store_explicit(&g_low_battery_mode, false, memory_order_release);
     }
-    atomic_store_explicit(&g_low_battery_threshold, temp_low_battery_threshold, memory_order_release);
-    atomic_store_explicit(&g_power_save_max_rate, temp_power_save_max_rate, memory_order_release);
+    atomic_store_explicit(&g_low_battery_threshold, temp.low_battery_threshold, memory_order_release);
+    atomic_store_explicit(&g_power_save_max_rate, temp.power_save_max_rate, memory_order_release);
 
     LOGI("Parsed dfps.conf successfully. Rules loaded: %d rules", g_rule_count);
     LOGI("Params: slack=%d ms, frame_rate_flex=%d, min_bright=%d, "
          "min_bright_thresh=%d%%, debug=%d",
-         temp_slack, temp_frame_rate_flex, temp_min_bright,
-         temp_min_bright_threshold, temp_debug);
+         temp.slack, temp.frame_rate_flex, temp.min_bright,
+         temp.min_bright_threshold, temp.debug);
     LOGI("Fallback behavior: Idle: %d Hz | Active: %d Hz",
-         temp_default_idle, temp_default_active);
-    LOGI("Offscreen behavior: %d Hz", temp_offscreen_rate);
+         temp.default_idle, temp.default_active);
+    LOGI("Offscreen behavior: %d Hz", temp.offscreen_rate);
     LOGI("Battery Saver: %s, Threshold: %d%%, MaxRate: %d Hz",
-         temp_battery_saver ? "ON" : "OFF",
-         temp_low_battery_threshold, temp_power_save_max_rate);
+         temp.battery_saver ? "ON" : "OFF",
+         temp.low_battery_threshold, temp.power_save_max_rate);
 }
