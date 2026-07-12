@@ -236,8 +236,9 @@ typedef struct {
 /* Touch contacts shorter than this (monotonic ms) are ignored for rate
  * purposes. Panels routinely emit spurious / self-cancelling MT contacts
  * while idle; without this debounce the rate ramps between idle and active.
+ * 80 ms filters multi-frame phantoms that still clear under a finger-tap.
  * Tune down if you need very quick taps to engage the active rate. */
-#define TOUCH_DEBOUNCE_MS       50
+#define TOUCH_DEBOUNCE_MS       80
 
 /* SurfaceFlinger vendor "backdoor" transaction codes (see docs/HELP.md).
  * These are NOT standard AOSP ISurfaceComposer codes — they are OEM/ROM-specific
@@ -315,6 +316,11 @@ extern _Atomic bool     g_touching;
  * contact began. Touch-thread-only; 0 means no contact in progress.
  * Used to debounce short phantom contacts before they engage the rate. */
 extern uint64_t         g_touch_down_since;
+/* Touch-thread-only: arm idle drop after contact end; clear after settle.
+ * Prevents netlink recvfrom wakes from re-driving rate control. */
+extern bool             g_idle_drop_armed;
+/* Touch-thread-only: deferred SF retry after a failed apply (0 = none). */
+extern uint64_t         g_rate_retry_at_ms;
 extern bool             g_root_mode;
 extern _Atomic bool     g_shutdown_requested;
 
@@ -458,8 +464,11 @@ void setSurfaceFlingerFrameRateFlex(bool enable);
 void invalidateRateModeCache(void);
 void setRefreshRate(int32_t rate);
 /* `now` is CLOCK_MONOTONIC_COARSE ms from the caller's epoll iteration so the
- * hot path does not issue a second clock_gettime. */
-void updateRateState(uint64_t now);
+ * hot path does not issue a second clock_gettime.
+ * Returns true when the desired rate is already applied (or nothing to do).
+ * Returns false if a SurfaceFlinger write was attempted but did not stick —
+ * caller may schedule a single retry, not a busy re-eval on every uevent. */
+bool updateRateState(uint64_t now);
 void updateCurrentAppRates(const char* pkg);
 
 static inline int getPollTimeout(uint64_t now) {
@@ -471,8 +480,7 @@ static inline int getPollTimeout(uint64_t now) {
      * other wake source. Do not short-circuit to -1 solely because
      * g_display_callback_active is set.
      *
-     * g_touch_down_since is touch-thread-only (same thread as the epoll loop
-     * that calls this helper), so a plain read is fine. */
+     * g_touch_down_since / g_idle_drop_armed are touch-thread-only. */
     bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
     if (!interactive) return -1;
 
@@ -490,19 +498,28 @@ static inline int getPollTimeout(uint64_t now) {
         return 0; /* debounce elapsed; loop must re-evaluate */
     }
 
+    /* Deferred SF retry after a failed apply (rare). */
+    if (g_rate_retry_at_ms != 0) {
+        if (now < g_rate_retry_at_ms)
+            return (int)(g_rate_retry_at_ms - now);
+        return 0;
+    }
+
+    /* One-shot idle drop after touch-up + slack. Armed only on contact end;
+     * never re-armed by uevent/netlink. */
+    if (!g_idle_drop_armed) return -1;
+
     uint64_t last_touch = atomic_load_explicit(&g_last_touch_time, memory_order_relaxed);
-    /* No touch observed yet (or state was cleared): nothing to expire. */
     if (last_touch == 0) return -1;
 
     int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);
-    if (slack <= 0) return -1;
+    if (slack <= 0) return 0; /* apply idle immediately */
 
     uint64_t expire = last_touch + (uint64_t)slack;
-    if (now < expire) {
+    if (now < expire)
         return (int)(expire - now);
-    }
 
-    return -1;
+    return 0; /* slack elapsed — one idle apply, then disarm */
 }
 
 /* binder.c */

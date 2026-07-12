@@ -92,19 +92,32 @@ static bool setSfActiveConfigDirect(int32_t id) {
     }
 
     AParcel* in = NULL;
-    if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) == STATUS_OK && in) {
-        g_hot_ops.writeInt32(in, id);
-        AParcel* reply = NULL;
-        binder_status_t status = g_hot_ops.transact(
-            g_hot_binders.surfaceFlinger, SF_TX_SET_ACTIVE_CONFIG, &in, &reply, 0);
-        if (status == STATUS_OK) {
-            if (reply) g_hot_ops.deleteParcel(reply);
-            return true;
+    if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) != STATUS_OK || !in) {
+        /* Rate-limit: associateClass may be missing on some ROMs; spamming
+         * LOGE every epoll tick makes thrashing look worse than it is. */
+        static uint64_t last_prep_log = 0;
+        uint64_t t = getNowMs();
+        if (t - last_prep_log >= 5000) {
+            last_prep_log = t;
+            LOGE("Failed preparing SurfaceFlinger transaction %u (class not set?).",
+                 SF_TX_SET_ACTIVE_CONFIG);
         }
-        if (reply) g_hot_ops.deleteParcel(reply);
+        return false;
+    }
+
+    g_hot_ops.writeInt32(in, id);
+    AParcel* reply = NULL;
+    binder_status_t status = g_hot_ops.transact(
+        g_hot_binders.surfaceFlinger, SF_TX_SET_ACTIVE_CONFIG, &in, &reply, 0);
+    if (reply) g_hot_ops.deleteParcel(reply);
+    if (status == STATUS_OK) return true;
+
+    static uint64_t last_tx_log = 0;
+    uint64_t t = getNowMs();
+    if (t - last_tx_log >= 5000) {
+        last_tx_log = t;
         LOGE("Direct SurfaceFlinger binder transaction %u failed: status %d",
              SF_TX_SET_ACTIVE_CONFIG, status);
-        return false;
     }
     return false;
 }
@@ -158,19 +171,22 @@ void setRefreshRate(int32_t rate) {
 
     if (atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == rate) return;
 
-    LOG_HOT("Transitioning device physical refresh rate to: %d Hz", rate);
+    /* Always log transitions at INFO when DEBUG is on — LOG_HOT is compiled out
+     * and left operators blind when diagnosing thrashing. */
+    LOGI("Transitioning device physical refresh rate to: %d Hz", rate);
 
     int32_t id = resolveRootId(rate);
     if (id >= 0) {
         if (setSfActiveConfigDirect(id)) {
             atomic_store_explicit(&g_last_set_rate, rate, memory_order_relaxed);
         }
+        /* On failure leave g_last_set_rate unchanged so the next re-eval retries. */
     } else {
         LOGE("Failed mapping %d Hz to an ID in modes.map!", rate);
     }
 }
 
-void updateRateState(uint64_t now) {
+bool updateRateState(uint64_t now) {
     bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
     int32_t target_rate = -1;
 
@@ -192,7 +208,7 @@ void updateRateState(uint64_t now) {
         bool touching = atomic_load_explicit(&g_touching, memory_order_relaxed);
         int32_t slack = atomic_load_explicit(&g_touch_slack_ms, memory_order_relaxed);
 
-        if (touching || (now - last_touch < (uint64_t)slack)) {
+        if (touching || (last_touch != 0 && now - last_touch < (uint64_t)slack)) {
             int32_t active_rate = atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed);
             if (atomic_load_explicit(&g_power_save_mode, memory_order_acquire) ||
                 atomic_load_explicit(&g_low_battery_mode, memory_order_acquire)) {
@@ -208,10 +224,13 @@ void updateRateState(uint64_t now) {
         }
     }
 
-    if (target_rate <= 0) return;
-    if (atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == target_rate) return;
+    if (target_rate <= 0) return true; /* nothing to apply */
+    if (atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == target_rate)
+        return true; /* already at target */
 
     setRefreshRate(target_rate);
+    /* setRefreshRate only updates g_last_set_rate on SF success. */
+    return atomic_load_explicit(&g_last_set_rate, memory_order_relaxed) == target_rate;
 }
 
 void updateCurrentAppRates(const char* pkg) {

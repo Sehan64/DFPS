@@ -64,6 +64,10 @@ _Atomic uint64_t  g_last_touch_time = 0;
 _Atomic bool      g_screen_interactive = true;
 _Atomic bool      g_touching = false;
 uint64_t          g_touch_down_since = 0;
+/* Touch-thread-only: arm idle drop after contact end; clear after settle. */
+bool              g_idle_drop_armed = false;
+/* Touch-thread-only: deferred SF retry after a failed apply (0 = none). */
+uint64_t          g_rate_retry_at_ms = 0;
 bool              g_root_mode = false;
 _Atomic bool      g_shutdown_requested = false;
 static volatile sig_atomic_t s_shutdown_signal_seen = 0;
@@ -281,36 +285,21 @@ static inline void setPrctlFlag(unsigned long op, unsigned long arg) {
     prctl(op, arg, 0, 0, 0);
 }
 
-int main(int argc, char** argv) {
-    /* Version / help must work even when run unprivileged or before
-     * any heavy setup, so handle it first. */
-    if (argc > 1) {
-        if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
-            if (kDfpBuild[0])
-                printf("dfpsd %s (build %s)\n", kDfpVersion, kDfpBuild);
-            else
-                printf("dfpsd %s\n", kDfpVersion);
-            return 0;
-        }
-        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-            printf("dfpsd %s - Dynamic FPS Controller\n"
-                   "usage: dfpsd [-v|--version] [-h|--help]\n"
-                   "  -v, --version  print version and build stamp, then exit\n"
-                   "  -h, --help     print this help, then exit\n",
-                   kDfpVersion);
-            return 0;
-        }
-    }
+/* ================================================================== */
+/*  Cold startup helpers (order matters — see main)                    */
+/* ================================================================== */
 
+__attribute__((cold))
+static void setupProcessHardening(void) {
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         /* Non-root and some kernels reject this; log but continue. */
         LOGW("mlockall(MCL_CURRENT | MCL_FUTURE) failed: %s — pages may be paged out under pressure.",
              strerror(errno));
     }
     setPrctlFlag(PR_SET_TIMERSLACK, 0);
-    #ifndef PR_SET_IO_FLUSHER
-    #define PR_SET_IO_FLUSHER 33
-    #endif
+#ifndef PR_SET_IO_FLUSHER
+#define PR_SET_IO_FLUSHER 33
+#endif
     setPrctlFlag(PR_SET_IO_FLUSHER, 1);
 
     /* Hardening: the daemon runs as root (needed for /dev/input and the
@@ -320,15 +309,15 @@ int main(int argc, char** argv) {
      * A full capability-set reduction is intentionally left to the init
      * / SELinux context (see docs/INIT.md), where the exact caps
      * required for input/uevent access are known. */
-    #ifndef PR_SET_NO_NEW_PRIVS
-    #define PR_SET_NO_NEW_PRIVS 38
-    #endif
-    #ifndef PR_SET_DUMPABLE
-    #define PR_SET_DUMPABLE 4
-    #endif
-    #ifndef PR_SET_KEEP_CAPS
-    #define PR_SET_KEEP_CAPS 7
-    #endif
+#ifndef PR_SET_NO_NEW_PRIVS
+#define PR_SET_NO_NEW_PRIVS 38
+#endif
+#ifndef PR_SET_DUMPABLE
+#define PR_SET_DUMPABLE 4
+#endif
+#ifndef PR_SET_KEEP_CAPS
+#define PR_SET_KEEP_CAPS 7
+#endif
     setPrctlFlag(PR_SET_NO_NEW_PRIVS, 1);
     setPrctlFlag(PR_SET_DUMPABLE, 0);
     setPrctlFlag(PR_SET_KEEP_CAPS, 1);
@@ -342,21 +331,29 @@ int main(int argc, char** argv) {
     }
 
     setupCpuAffinity();
+}
 
+/* Returns false on lock init failure (caller should exit). */
+__attribute__((cold))
+static bool initSyncPrimitives(void) {
     if (pthread_spin_init(&g_client_lock, 0) != 0) {
         LOGE("Failed to initialize client spinlock: %s", strerror(errno));
-        return 1;
+        return false;
     }
     if (pthread_rwlock_init(&g_config_lock, NULL) != 0) {
         LOGE("Failed to initialize config rwlock: %s", strerror(errno));
         pthread_spin_destroy(&g_client_lock);
-        return 1;
+        return false;
     }
 
     memset(g_child_task_names, 0, sizeof(g_child_task_names));
     memset(g_last_package_prefixes, 0, sizeof(g_last_package_prefixes));
     for (int i = 0; i < RULE_HASH_SLOTS; i++) g_rule_hash[i].index = -1;
+    return true;
+}
 
+__attribute__((cold))
+static void installSignalHandlers(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = shutdownHandler;
@@ -383,31 +380,15 @@ int main(int argc, char** argv) {
     sigaction(SIGBUS,  &fa, NULL);
     sigaction(SIGILL,  &fa, NULL);
     sigaction(SIGFPE,  &fa, NULL);
+}
 
-    uid_t my_uid = getuid();
-    g_root_mode = (my_uid == 0);
-
-    initLogging();
-
-    g_start_time = getNowMs();
-
-    LOGI("==============================================");
-    LOGI("      Dynamic FPS Controller Initiated        ");
-    LOGI("==============================================");
-    LOGI("UID: %d | Execution Profile: %s", my_uid,
-         g_root_mode ? "ROOT" : "NON-ROOT");
-
-    g_wakeup_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (g_wakeup_fd < 0) {
-        LOGE("Failed to create eventfd synchronization descriptor.");
-        return 1;
-    }
-
-    /* Load libbinder_ndk.so and resolve all function pointers */
+/* dlopen libbinder_ndk, resolve symbols, start pool + death recipient. */
+__attribute__((cold))
+static bool loadBinderNdk(void) {
     g_cold.lib = dlopen("libbinder_ndk.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_cold.lib)
         g_cold.lib = dlopen("/system/lib64/libbinder_ndk.so", RTLD_NOW | RTLD_LOCAL);
-    if (!g_cold.lib) { LOGE("libbinder_ndk.so open error."); return 1; }
+    if (!g_cold.lib) { LOGE("libbinder_ndk.so open error."); return false; }
 
     g_cold.getService        = (getService_t)dlsym(g_cold.lib, "AServiceManager_getService");
     g_cold.waitForService    = (waitForService_t)dlsym(g_cold.lib, "AServiceManager_waitForService");
@@ -436,7 +417,7 @@ int main(int argc, char** argv) {
         !g_hot_ops.deleteParcel || !g_cold.startThreadPool ||
         !g_cold.writeString || !g_hot_ops.writeInt32 || !g_hot_ops.writeInt64) {
         LOGE("dlsym resolution failure.");
-        return 1;
+        return false;
     }
 
     /* One dedicated binder pool thread is enough for our lightweight
@@ -448,45 +429,48 @@ int main(int argc, char** argv) {
     g_cold.startThreadPool();
     if (g_cold.DeathRecipient_new)
         g_cold.deathRecipient = g_cold.DeathRecipient_new(onBinderDied);
+    return true;
+}
 
-    if (g_cold.lib) {
-        /* Acquire system binder services */
-        g_hot_binders.activityManager = g_cold.getService("activity");
-        if (!g_hot_binders.activityManager && g_cold.waitForService)
-            g_hot_binders.activityManager = g_cold.waitForService("activity");
-        if (!g_hot_binders.activityManager) { LOGE("ActivityManager binder missing."); return 1; }
-        if (g_cold.linkToDeath && g_cold.deathRecipient)
-            g_cold.linkToDeath(g_hot_binders.activityManager, g_cold.deathRecipient, NULL);
-
-        g_hot_binders.powerManager = g_cold.getService("power");
-        if (!g_hot_binders.powerManager && g_cold.waitForService)
-            g_hot_binders.powerManager = g_cold.waitForService("power");
-        if (g_hot_binders.powerManager && g_cold.linkToDeath && g_cold.deathRecipient)
-            g_cold.linkToDeath(g_hot_binders.powerManager, g_cold.deathRecipient, NULL);
-
-        g_hot_binders.surfaceFlinger = g_cold.getService("SurfaceFlinger");
-        if (!g_hot_binders.surfaceFlinger && g_cold.waitForService)
-            g_hot_binders.surfaceFlinger = g_cold.waitForService("SurfaceFlinger");
-        if (g_hot_binders.surfaceFlinger && g_cold.linkToDeath && g_cold.deathRecipient)
-            g_cold.linkToDeath(g_hot_binders.surfaceFlinger, g_cold.deathRecipient, NULL);
-
-        g_hot_binders.displayManager = g_cold.getService("display");
-        if (!g_hot_binders.displayManager && g_cold.waitForService)
-            g_hot_binders.displayManager = g_cold.waitForService("display");
-        if (g_hot_binders.displayManager && g_cold.linkToDeath && g_cold.deathRecipient)
-            g_cold.linkToDeath(g_hot_binders.displayManager, g_cold.deathRecipient, NULL);
-
-        g_hot_binders.batteryPropertiesRegistrar = g_cold.getService("batteryproperties");
-        if (!g_hot_binders.batteryPropertiesRegistrar && g_cold.waitForService)
-            g_hot_binders.batteryPropertiesRegistrar = g_cold.waitForService("batteryproperties");
+/* getService / waitForService + optional death link. AM is required. */
+__attribute__((cold))
+static AIBinder* acquireService(const char* name, bool required, bool link_death) {
+    AIBinder* binder = g_cold.getService(name);
+    if (!binder && g_cold.waitForService)
+        binder = g_cold.waitForService(name);
+    if (!binder) {
+        if (required) LOGE("%s binder missing.", name);
+        return NULL;
     }
+    if (link_death && g_cold.linkToDeath && g_cold.deathRecipient)
+        g_cold.linkToDeath(binder, g_cold.deathRecipient, NULL);
+    return binder;
+}
 
-    /* Associate dummy classes for client-side binder proxies */
+__attribute__((cold))
+static bool acquireSystemServices(void) {
+    if (!g_cold.lib) return false;
+
+    g_hot_binders.activityManager = acquireService("activity", true, true);
+    if (!g_hot_binders.activityManager) return false;
+
+    g_hot_binders.powerManager = acquireService("power", false, true);
+    g_hot_binders.surfaceFlinger = acquireService("SurfaceFlinger", false, true);
+    g_hot_binders.displayManager = acquireService("display", false, true);
+    /* batteryproperties: no death link (matches prior behavior). */
+    g_hot_binders.batteryPropertiesRegistrar =
+        acquireService("batteryproperties", false, false);
+    return true;
+}
+
+/* Associate dummy client-side classes so prepareTransaction succeeds. */
+__attribute__((cold))
+static bool associateClientClasses(void) {
     AIBinder_Class* amClazz = g_cold.Class_define("android.app.IActivityManager",
                                                     dummyOnCreate, dummyOnDestroy,
                                                     dummyOnTransact);
     if (amClazz) g_cold.associateClass(g_hot_binders.activityManager, amClazz);
-    else { LOGE("Failed defining ActivityManager class."); return 1; }
+    else { LOGE("Failed defining ActivityManager class."); return false; }
 
     if (g_hot_binders.surfaceFlinger) {
         AIBinder_Class* sfClazz = g_cold.Class_define("android.ui.ISurfaceComposer",
@@ -494,6 +478,224 @@ int main(int argc, char** argv) {
                                                         dummyOnTransact);
         if (sfClazz) g_cold.associateClass(g_hot_binders.surfaceFlinger, sfClazz);
     }
+
+    /* PowerManager and DisplayManager also need a client-side class association
+     * before AIBinder_prepareTransaction succeeds. Without this, interactive /
+     * power-save / brightness probes log "Class is not set" and silently fail,
+     * which leaves g_screen_interactive / power flags stale and rate control
+     * thrashing or stuck. */
+    if (g_hot_binders.powerManager) {
+        AIBinder_Class* pmClazz = g_cold.Class_define("android.os.IPowerManager",
+                                                        dummyOnCreate, dummyOnDestroy,
+                                                        dummyOnTransact);
+        if (pmClazz) g_cold.associateClass(g_hot_binders.powerManager, pmClazz);
+    }
+    if (g_hot_binders.displayManager) {
+        AIBinder_Class* dmClazz = g_cold.Class_define(
+            "android.hardware.display.IDisplayManager",
+            dummyOnCreate, dummyOnDestroy, dummyOnTransact);
+        if (dmClazz) g_cold.associateClass(g_hot_binders.displayManager, dmClazz);
+    }
+    return true;
+}
+
+__attribute__((cold))
+static void setupUeventSocket(void) {
+    if (!g_root_mode) return;
+
+    g_uevent_fd = socket(PF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                         NETLINK_KOBJECT_UEVENT);
+    if (g_uevent_fd < 0) return;
+
+    struct sockaddr_nl addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.nl_family = AF_NETLINK;
+    addr.nl_pid    = getpid();
+    addr.nl_groups = 1;
+    if (bind(g_uevent_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOGE("Failed to bind netlink uevent socket");
+        close(g_uevent_fd);
+        g_uevent_fd = -1;
+    } else {
+        LOGI("Netlink uevent listener initialized for battery events");
+    }
+}
+
+__attribute__((cold))
+static void registerBatteryListener(void) {
+    if (!g_hot_binders.batteryPropertiesRegistrar ||
+        g_hot_ops.resolvedRegisterBatteryListenerCode == 0 ||
+        g_hot_ops.resolvedBatteryChangedCode == 0) {
+        return;
+    }
+
+    AIBinder_Class* battClazz = g_cold.Class_define(
+        "android.os.IBatteryPropertiesRegistrar",
+        dummyOnCreate, dummyOnDestroy, dummyOnTransact);
+    if (!battClazz) return;
+
+    g_cold.associateClass(g_hot_binders.batteryPropertiesRegistrar, battClazz);
+    AIBinder_Class* battListenerClazz = g_cold.Class_define(
+        "android.os.IBatteryPropertiesListener",
+        dummyOnCreate, dummyOnDestroy, batteryListenerOnTransact);
+    if (!battListenerClazz) return;
+
+    AIBinder* battListener = g_cold.AIBinder_new(battListenerClazz, NULL);
+    if (!battListener) return;
+
+    g_cold.associateClass(battListener, battListenerClazz);
+    AParcel* in = NULL;
+    if (g_hot_ops.prepareTransaction(
+            g_hot_binders.batteryPropertiesRegistrar, &in) != STATUS_OK || !in) {
+        return;
+    }
+    g_cold.writeString(in, battListener);
+    AParcel* reply = NULL;
+    binder_status_t s = g_hot_ops.transact(
+        g_hot_binders.batteryPropertiesRegistrar,
+        g_hot_ops.resolvedRegisterBatteryListenerCode,
+        &in, &reply, 0);
+    if (s != STATUS_OK) {
+        LOGE("Failed to register battery listener: %d", s);
+    } else {
+        LOGI("Battery listener registered successfully via Binder");
+    }
+    if (reply) g_hot_ops.deleteParcel(reply);
+}
+
+__attribute__((cold))
+static void registerDisplayCallback(void) {
+    if (!g_hot_binders.displayManager) return;
+
+    AIBinder_Class* displayClazz = g_cold.Class_define(
+        "android.hardware.display.IDisplayManager",
+        dummyOnCreate, dummyOnDestroy, dummyOnTransact);
+    if (!displayClazz) return;
+
+    g_cold.associateClass(g_hot_binders.displayManager, displayClazz);
+
+    AIBinder_Class* displayCallbackClazz = g_cold.Class_define(
+        "android.hardware.display.IDisplayManagerCallback",
+        dummyOnCreate, dummyOnDestroy, displayCallbackOnTransact);
+    if (!displayCallbackClazz) return;
+
+    AIBinder* displayCallback = g_cold.AIBinder_new(displayCallbackClazz, NULL);
+    if (!displayCallback) return;
+
+    g_cold.associateClass(displayCallback, displayCallbackClazz);
+
+    AParcel* in = NULL;
+    binder_status_t status = g_hot_ops.prepareTransaction(
+        g_hot_binders.displayManager, &in);
+    if (status != STATUS_OK || !in) return;
+
+    if (g_hot_ops.resolvedRegisterCallbackWithEventMaskCode != 0) {
+        g_cold.writeString(in, displayCallback);
+
+        /* DisplayManagerService.CallbackRecord.shouldSendEvent
+         * maps event num → bit: 1→bit0(1), 2→bit2(4),
+         * 3→bit1(2), 4→bit3(8), 5→bit4(16). We want
+         * EVENT_DISPLAY_CHANGED(2) + EVENT_DISPLAY_BRIGHTNESS_CHANGED(4), so
+         * mask = bit2(4) | bit3(8) = 12. (Previously 2|4=6
+         * selected event 2_CHANGED + event 3_REMOVED, leaving
+         * brightness callbacks masked off — see F7.) */
+        int64_t event_mask = 4 | 8;
+        g_hot_ops.writeInt64(in, event_mask);
+    } else if (g_hot_ops.resolvedRegisterCallbackCode != 0) {
+        g_cold.writeString(in, displayCallback);
+    }
+
+    if (g_hot_ops.resolvedRegisterCallbackWithEventMaskCode == 0 &&
+        g_hot_ops.resolvedRegisterCallbackCode == 0) {
+        return;
+    }
+
+    AParcel* reply = NULL;
+    transaction_code_t reg_code =
+        g_hot_ops.resolvedRegisterCallbackWithEventMaskCode != 0
+        ? g_hot_ops.resolvedRegisterCallbackWithEventMaskCode
+        : g_hot_ops.resolvedRegisterCallbackCode;
+    binder_status_t reg_status = g_hot_ops.transact(
+        g_hot_binders.displayManager, reg_code, &in, &reply, 0);
+    if (reg_status != STATUS_OK) {
+        LOGE("Failed to register display callback (code %u): status %d",
+             reg_code, reg_status);
+    } else {
+        atomic_store_explicit(&g_display_callback_active, true,
+                              memory_order_relaxed);
+    }
+    if (reply) g_hot_ops.deleteParcel(reply);
+}
+
+__attribute__((cold))
+static bool registerProcessObserver(void) {
+    AIBinder_Class* obsClazz = g_cold.Class_define(
+        "android.app.IProcessObserver",
+        dummyOnCreate, dummyOnDestroy, observerOnTransact);
+    if (!obsClazz) { LOGE("Failed to define observer."); return false; }
+    g_cold.observer = g_cold.AIBinder_new(obsClazz, NULL);
+    if (!g_cold.observer) { LOGE("Instantiation error."); return false; }
+    g_cold.associateClass(g_cold.observer, obsClazz);
+
+    AParcel* in = NULL;
+    binder_status_t status = g_hot_ops.prepareTransaction(g_hot_binders.activityManager, &in);
+    if (status != STATUS_OK || !in) { LOGE("Observation preparation error."); return false; }
+    g_cold.writeString(in, g_cold.observer);
+
+    AParcel* reply = NULL;
+    status = g_hot_ops.transact(g_hot_binders.activityManager,
+                                 g_cold.resolvedProcessObserverCode, &in, &reply, 0);
+    if (status != STATUS_OK) { LOGE("Binder transaction failure."); return false; }
+    if (reply) g_hot_ops.deleteParcel(reply);
+    return true;
+}
+
+int main(int argc, char** argv) {
+    /* Version / help must work even when run unprivileged or before
+     * any heavy setup, so handle it first. */
+    if (argc > 1) {
+        if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
+            if (kDfpBuild[0])
+                printf("dfpsd %s (build %s)\n", kDfpVersion, kDfpBuild);
+            else
+                printf("dfpsd %s\n", kDfpVersion);
+            return 0;
+        }
+        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            printf("dfpsd %s - Dynamic FPS Controller\n"
+                   "usage: dfpsd [-v|--version] [-h|--help]\n"
+                   "  -v, --version  print version and build stamp, then exit\n"
+                   "  -h, --help     print this help, then exit\n",
+                   kDfpVersion);
+            return 0;
+        }
+    }
+
+    setupProcessHardening();
+    if (!initSyncPrimitives()) return 1;
+    installSignalHandlers();
+
+    uid_t my_uid = getuid();
+    g_root_mode = (my_uid == 0);
+
+    initLogging();
+    g_start_time = getNowMs();
+
+    LOGI("==============================================");
+    LOGI("      Dynamic FPS Controller Initiated        ");
+    LOGI("==============================================");
+    LOGI("UID: %d | Execution Profile: %s", my_uid,
+         g_root_mode ? "ROOT" : "NON-ROOT");
+
+    g_wakeup_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_wakeup_fd < 0) {
+        LOGE("Failed to create eventfd synchronization descriptor.");
+        return 1;
+    }
+
+    if (!loadBinderNdk()) return 1;
+    if (!acquireSystemServices()) return 1;
+    if (!associateClientClasses()) return 1;
 
     /* Resolve Binder transaction codes (cached or via app_process) */
     resolveTransactionCodes();
@@ -510,66 +712,10 @@ int main(int argc, char** argv) {
     loadConfig();
     loadModesMap();
 
-    if (!setupAbstractSocket()) {
-        return 1;
-    }
+    if (!setupAbstractSocket()) return 1;
 
-    /* Netlink uevent listener for battery events (root only) */
-    if (g_root_mode) {
-        g_uevent_fd = socket(PF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
-                             NETLINK_KOBJECT_UEVENT);
-        if (g_uevent_fd >= 0) {
-            struct sockaddr_nl addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.nl_family = AF_NETLINK;
-            addr.nl_pid    = getpid();
-            addr.nl_groups = 1;
-            if (bind(g_uevent_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-                LOGE("Failed to bind netlink uevent socket");
-                close(g_uevent_fd);
-                g_uevent_fd = -1;
-            } else {
-                LOGI("Netlink uevent listener initialized for battery events");
-            }
-        }
-    }
-
-    /* Register battery listener via Binder (if available) */
-    if (g_hot_binders.batteryPropertiesRegistrar &&
-        g_hot_ops.resolvedRegisterBatteryListenerCode != 0 &&
-        g_hot_ops.resolvedBatteryChangedCode != 0) {
-        AIBinder_Class* battClazz = g_cold.Class_define(
-            "android.os.IBatteryPropertiesRegistrar",
-            dummyOnCreate, dummyOnDestroy, dummyOnTransact);
-        if (battClazz) {
-            g_cold.associateClass(g_hot_binders.batteryPropertiesRegistrar, battClazz);
-            AIBinder_Class* battListenerClazz = g_cold.Class_define(
-                "android.os.IBatteryPropertiesListener",
-                dummyOnCreate, dummyOnDestroy, batteryListenerOnTransact);
-            if (battListenerClazz) {
-                AIBinder* battListener = g_cold.AIBinder_new(battListenerClazz, NULL);
-                if (battListener) {
-                    g_cold.associateClass(battListener, battListenerClazz);
-                    AParcel* in = NULL;
-                    if (g_hot_ops.prepareTransaction(
-                            g_hot_binders.batteryPropertiesRegistrar, &in) == STATUS_OK && in) {
-                        g_cold.writeString(in, battListener);
-                        AParcel* reply = NULL;
-                        binder_status_t s = g_hot_ops.transact(
-                            g_hot_binders.batteryPropertiesRegistrar,
-                            g_hot_ops.resolvedRegisterBatteryListenerCode,
-                            &in, &reply, 0);
-                        if (s != STATUS_OK) {
-                            LOGE("Failed to register battery listener: %d", s);
-                        } else {
-                            LOGI("Battery listener registered successfully via Binder");
-                        }
-                        if (reply) g_hot_ops.deleteParcel(reply);
-                    }
-                }
-            }
-        }
-    }
+    setupUeventSocket();
+    registerBatteryListener();
 
     /* Read initial battery state (before the epoll thread is running — any
      * rate-relevant transition is applied by the first updateRateState after
@@ -592,90 +738,25 @@ int main(int argc, char** argv) {
     }
     pthread_attr_destroy(&attr);
 
-    /* Register display change callback */
-    if (g_hot_binders.displayManager) {
-        AIBinder_Class* displayClazz = g_cold.Class_define(
-            "android.hardware.display.IDisplayManager",
-            dummyOnCreate, dummyOnDestroy, dummyOnTransact);
-        if (displayClazz) {
-            g_cold.associateClass(g_hot_binders.displayManager, displayClazz);
-
-            AIBinder_Class* displayCallbackClazz = g_cold.Class_define(
-                "android.hardware.display.IDisplayManagerCallback",
-                dummyOnCreate, dummyOnDestroy, displayCallbackOnTransact);
-            if (displayCallbackClazz) {
-                AIBinder* displayCallback = g_cold.AIBinder_new(displayCallbackClazz, NULL);
-                if (displayCallback) {
-                    g_cold.associateClass(displayCallback, displayCallbackClazz);
-
-                    AParcel* in = NULL;
-                    binder_status_t status = g_hot_ops.prepareTransaction(
-                        g_hot_binders.displayManager, &in);
-                    if (status == STATUS_OK && in) {
-                        if (g_hot_ops.resolvedRegisterCallbackWithEventMaskCode != 0) {
-                            g_cold.writeString(in, displayCallback);
-
-                            /* DisplayManagerService.CallbackRecord.shouldSendEvent
-                             * maps event num → bit: 1→bit0(1), 2→bit2(4),
-                             * 3→bit1(2), 4→bit3(8), 5→bit4(16). We want
-                             * EVENT_DISPLAY_CHANGED(2) + EVENT_DISPLAY_BRIGHTNESS_CHANGED(4), so
-                             * mask = bit2(4) | bit3(8) = 12. (Previously 2|4=6
-                             * selected event 2_CHANGED + event 3_REMOVED, leaving
-                             * brightness callbacks masked off — see F7.) */
-                            int64_t event_mask = 4 | 8;
-                            g_hot_ops.writeInt64(in, event_mask);
-                        } else if (g_hot_ops.resolvedRegisterCallbackCode != 0) {
-                            g_cold.writeString(in, displayCallback);
-                        }
-
-                        if (g_hot_ops.resolvedRegisterCallbackWithEventMaskCode != 0 ||
-                            g_hot_ops.resolvedRegisterCallbackCode != 0) {
-                            AParcel* reply = NULL;
-                            transaction_code_t reg_code =
-                                g_hot_ops.resolvedRegisterCallbackWithEventMaskCode != 0
-                                ? g_hot_ops.resolvedRegisterCallbackWithEventMaskCode
-                                : g_hot_ops.resolvedRegisterCallbackCode;
-                            binder_status_t reg_status = g_hot_ops.transact(
-                                g_hot_binders.displayManager, reg_code, &in, &reply, 0);
-                            if (reg_status != STATUS_OK) {
-                                LOGE("Failed to register display callback (code %u): status %d",
-                                     reg_code, reg_status);
-                            } else {
-                                atomic_store_explicit(&g_display_callback_active, true,
-                                                      memory_order_relaxed);
-                            }
-                            if (reply) g_hot_ops.deleteParcel(reply);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    registerDisplayCallback();
 
     (void)checkInteractiveAndPowerSave(true);
     (void)checkMinBrightness();
 
-    /* Register process observer for foreground app tracking */
-    AIBinder_Class* obsClazz = g_cold.Class_define(
-        "android.app.IProcessObserver",
-        dummyOnCreate, dummyOnDestroy, observerOnTransact);
-    if (!obsClazz) { LOGE("Failed to define observer."); return 1; }
-    g_cold.observer = g_cold.AIBinder_new(obsClazz, NULL);
-    if (!g_cold.observer) { LOGE("Instantiation error."); return 1; }
-    g_cold.associateClass(g_cold.observer, obsClazz);
-
-    AParcel* in = NULL;
-    binder_status_t status = g_hot_ops.prepareTransaction(g_hot_binders.activityManager, &in);
-    if (status != STATUS_OK || !in) { LOGE("Observation preparation error."); return 1; }
-    g_cold.writeString(in, g_cold.observer);
-
-    AParcel* reply = NULL;
-    status = g_hot_ops.transact(g_hot_binders.activityManager,
-                                 g_cold.resolvedProcessObserverCode, &in, &reply, 0);
-    if (status != STATUS_OK) { LOGE("Binder transaction failure."); return 1; }
-    if (reply) g_hot_ops.deleteParcel(reply);
+    if (!registerProcessObserver()) return 1;
 
     queryFocusedTask();
+
+    /* Apply the initial rate for the focused package. queryFocusedTask may have
+     * updated idle/active rates, but nothing has called setRefreshRate yet —
+     * without this the panel stays at whatever the system last set until the
+     * first touch/slack cycle, which looks like "idle does not clamp". */
+    if (!updateRateState(getNowMs())) {
+        /* Touch thread will pick up a deferred retry via g_rate_retry_at_ms
+         * once it is running; arm a short retry and wake it. */
+        g_rate_retry_at_ms = getNowMs() + 250;
+    }
+    triggerPollerWakeup();
 
     /* Block until the event-loop thread exits. That thread owns the shutdown
      * lifecycle: SIGTERM/SIGINT (or a socket "exit") sets the shutdown flag,
