@@ -85,39 +85,50 @@ static int32_t resolveRootId(int32_t rate) {
     return s_last_id_out;
 }
 
+/* Prepare + writeInt32 + transact + deleteParcel against SurfaceFlinger.
+ * Returns the binder status; *prepared is set false when prepareTransaction
+ * failed (so callers can log that distinctly). Callers own logging. */
+static binder_status_t sf_transact_int(uint32_t code, int32_t arg, bool* prepared) {
+    *prepared = false;
+    AParcel* in = NULL;
+    if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) != STATUS_OK || !in)
+        return STATUS_OK; /* caller inspects *prepared to tell prepare failure */
+    *prepared = true;
+    g_hot_ops.writeInt32(in, arg);
+    AParcel* reply = NULL;
+    binder_status_t status = g_hot_ops.transact(
+        g_hot_binders.surfaceFlinger, code, &in, &reply, 0);
+    if (reply) g_hot_ops.deleteParcel(reply);
+    return status;
+}
+
 static bool setSfActiveConfigDirect(int32_t id) {
     if (!g_hot_binders.surfaceFlinger) {
         LOGE("SurfaceFlinger binder missing in hot context.");
         return false;
     }
 
-    AParcel* in = NULL;
-    if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) != STATUS_OK || !in) {
-        /* Rate-limit: associateClass may be missing on some ROMs; spamming
-         * LOGE every epoll tick makes thrashing look worse than it is. */
+    bool prepared = false;
+    binder_status_t status = sf_transact_int(SF_TX_SET_ACTIVE_CONFIG, id, &prepared);
+    if (status == STATUS_OK) return true;
+
+    /* Rate-limit: associateClass may be missing on some ROMs; spamming
+     * LOGE every epoll tick makes thrashing look worse than it is. */
+    uint64_t t = getNowMs();
+    if (!prepared) {
         static uint64_t last_prep_log = 0;
-        uint64_t t = getNowMs();
         if (t - last_prep_log >= 5000) {
             last_prep_log = t;
             LOGE("Failed preparing SurfaceFlinger transaction %u (class not set?).",
                  SF_TX_SET_ACTIVE_CONFIG);
         }
-        return false;
-    }
-
-    g_hot_ops.writeInt32(in, id);
-    AParcel* reply = NULL;
-    binder_status_t status = g_hot_ops.transact(
-        g_hot_binders.surfaceFlinger, SF_TX_SET_ACTIVE_CONFIG, &in, &reply, 0);
-    if (reply) g_hot_ops.deleteParcel(reply);
-    if (status == STATUS_OK) return true;
-
-    static uint64_t last_tx_log = 0;
-    uint64_t t = getNowMs();
-    if (t - last_tx_log >= 5000) {
-        last_tx_log = t;
-        LOGE("Direct SurfaceFlinger binder transaction %u failed: status %d",
-             SF_TX_SET_ACTIVE_CONFIG, status);
+    } else {
+        static uint64_t last_tx_log = 0;
+        if (t - last_tx_log >= 5000) {
+            last_tx_log = t;
+            LOGE("Direct SurfaceFlinger binder transaction %u failed: status %d",
+                 SF_TX_SET_ACTIVE_CONFIG, status);
+        }
     }
     return false;
 }
@@ -132,21 +143,16 @@ void setSurfaceFlingerFrameRateFlex(bool enable) {
         return;
     }
 
-    AParcel* in = NULL;
-    if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) != STATUS_OK || !in) {
-        LOGE("Failed preparing SurfaceFlinger transaction %u.", SF_TX_FRAME_RATE_FLEX);
-        return;
-    }
-
-    g_hot_ops.writeInt32(in, enable ? 1 : 0);
-    AParcel* reply = NULL;
-    binder_status_t status = g_hot_ops.transact(
-        g_hot_binders.surfaceFlinger, SF_TX_FRAME_RATE_FLEX, &in, &reply, 0);
-    if (reply) g_hot_ops.deleteParcel(reply);
+    bool prepared = false;
+    binder_status_t status = sf_transact_int(SF_TX_FRAME_RATE_FLEX, enable ? 1 : 0,
+                                            &prepared);
 
     if (status == STATUS_OK) {
         LOGI("SurfaceFlinger frame-rate flexibility %s via transaction %u.",
              enable ? "enabled" : "disabled", SF_TX_FRAME_RATE_FLEX);
+    } else if (!prepared) {
+        LOGE("Failed preparing SurfaceFlinger transaction %u.",
+             SF_TX_FRAME_RATE_FLEX);
     } else {
         LOGW("SurfaceFlinger transaction %u failed: status %d. "
              "Continuing with direct mode changes only.",
