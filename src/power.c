@@ -103,6 +103,19 @@ int32_t readInitialBatteryLevel(void) {
 /*  Interactive / power-save state queries (Binder)                    */
 /* ================================================================== */
 
+/* Read exception code + bool result from a completed PowerManager reply.
+ * Returns true when both fields were read and exception == 0. */
+static bool read_pm_bool_reply(AParcel* reply, bool* out) {
+    int32_t exception = -1;
+    int32_t result = -1;
+    if (g_hot_ops.readInt32(reply, &exception) != STATUS_OK || exception != 0)
+        return false;
+    if (g_hot_ops.readInt32(reply, &result) != STATUS_OK)
+        return false;
+    *out = (result != 0);
+    return true;
+}
+
 bool checkInteractiveAndPowerSave(bool probe_interactive) {
     bool changed = false;
     if (!g_hot_binders.powerManager) return false;
@@ -122,19 +135,15 @@ bool checkInteractiveAndPowerSave(bool probe_interactive) {
                 g_hot_binders.powerManager,
                 g_hot_ops.resolvedIsInteractiveCode, &in, &reply, 0);
             if (status == STATUS_OK && reply) {
-                int32_t exception = -1;
-                int32_t result = -1;
-                if (g_hot_ops.readInt32(reply, &exception) == STATUS_OK && exception == 0) {
-                    if (g_hot_ops.readInt32(reply, &result) == STATUS_OK) {
-                        bool interactive = (result != 0);
-                        if (interactive != atomic_load_explicit(&g_screen_interactive,
-                                                                 memory_order_relaxed)) {
-                            LOGI("Interactive screen state changed: screen is now %s",
-                                  interactive ? "ON" : "OFF");
-                            atomic_store_explicit(&g_screen_interactive, interactive,
-                                                   memory_order_release);
-                            changed = true;
-                        }
+                bool interactive = false;
+                if (read_pm_bool_reply(reply, &interactive)) {
+                    if (interactive != atomic_load_explicit(&g_screen_interactive,
+                                                             memory_order_relaxed)) {
+                        LOGI("Interactive screen state changed: screen is now %s",
+                              interactive ? "ON" : "OFF");
+                        atomic_store_explicit(&g_screen_interactive, interactive,
+                                               memory_order_release);
+                        changed = true;
                     }
                 }
                 g_hot_ops.deleteParcel(reply);
@@ -152,19 +161,15 @@ bool checkInteractiveAndPowerSave(bool probe_interactive) {
                 g_hot_binders.powerManager,
                 g_hot_ops.resolvedIsPowerSaveModeCode, &in2, &reply2, 0);
             if (status == STATUS_OK && reply2) {
-                int32_t exception = -1;
-                int32_t result = -1;
-                if (g_hot_ops.readInt32(reply2, &exception) == STATUS_OK && exception == 0) {
-                    if (g_hot_ops.readInt32(reply2, &result) == STATUS_OK) {
-                        bool power_save = (result != 0);
-                        if (power_save != atomic_load_explicit(&g_power_save_mode,
-                                                                memory_order_relaxed)) {
-                            LOGI("System Power save mode changed: %s",
-                                 power_save ? "ON" : "OFF");
-                            atomic_store_explicit(&g_power_save_mode, power_save,
-                                                   memory_order_release);
-                            changed = true;
-                        }
+                bool power_save = false;
+                if (read_pm_bool_reply(reply2, &power_save)) {
+                    if (power_save != atomic_load_explicit(&g_power_save_mode,
+                                                            memory_order_relaxed)) {
+                        LOGI("System Power save mode changed: %s",
+                             power_save ? "ON" : "OFF");
+                        atomic_store_explicit(&g_power_save_mode, power_save,
+                                               memory_order_release);
+                        changed = true;
                     }
                 }
                 g_hot_ops.deleteParcel(reply2);
@@ -308,7 +313,9 @@ bool handleUevent(bool* state_changed) {
         p += strlen(p) + 1;
     }
 
-    if (is_power_supply && new_level >= 0) {
+    /* batterySaver off: capacity uevents cannot affect rate — drain only. */
+    if (is_power_supply && new_level >= 0 &&
+        atomic_load_explicit(&g_battery_saver, memory_order_relaxed)) {
         if (s_battery_supply_name[0] != '\0') {
             if (supply_name == NULL ||
                 strcmp(supply_name, s_battery_supply_name) != 0) {
