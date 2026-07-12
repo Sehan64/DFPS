@@ -503,6 +503,16 @@ __attribute__((cold))
 static void setupUeventSocket(void) {
     if (!g_root_mode) return;
 
+    /* The uevent netlink socket exists only to deliver fast battery-level
+     * updates. Battery level only drives the refresh rate when battery saver
+     * is enabled (config), and the 30s maintenance timerfd already probes it
+     * otherwise — so skip the socket (and its recvfrom wakeups) entirely when
+     * saver is off. */
+    if (!atomic_load_explicit(&g_battery_saver, memory_order_relaxed)) {
+        LOGI("Battery saver disabled: skipping netlink uevent listener");
+        return;
+    }
+
     g_uevent_fd = socket(PF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
                          NETLINK_KOBJECT_UEVENT);
     if (g_uevent_fd < 0) return;
