@@ -43,6 +43,14 @@ static int s_touch_current_slot[MAX_TOUCH_DEVICES];
  * node cannot clear an ongoing contact on another. */
 static bool s_touch_device_active[MAX_TOUCH_DEVICES];
 
+/* OR raw contacts across every registered digitizer. */
+static bool any_raw_contact(void) {
+    for (int t = 0; t < g_touch_fd_count; t++) {
+        if (s_touch_device_active[t]) return true;
+    }
+    return false;
+}
+
 /* ================================================================== */
 /*  Touch device discovery                                             */
 /* ================================================================== */
@@ -257,6 +265,381 @@ static inline void updateTouchStateFromEvent(const struct input_event* ev,
     }
 }
 
+/* ================================================================== */
+/*  Epoll loop phase helpers (touch-thread-only state)                 */
+/* ================================================================== */
+
+/* One-shot idle drop after slack, gated by g_rate_retry_at_ms so a deferred
+ * SF retry is not bypassed by sticky idle re-fire on every incidental wake. */
+static void maybe_arm_idle_rate_update(uint64_t now, bool* needs_rate_update) {
+    if (*needs_rate_update) return;
+    if (!g_idle_drop_armed || g_rate_retry_at_ms != 0) return;
+    if (atomic_load_explicit(&g_touching, memory_order_relaxed)) return;
+    if (g_touch_down_since != 0) return;
+
+    uint64_t last_touch = atomic_load_explicit(&g_last_touch_time,
+                                                 memory_order_relaxed);
+    int32_t slack = atomic_load_explicit(&g_touch_slack_ms,
+                                           memory_order_relaxed);
+    if (last_touch != 0 &&
+        (slack <= 0 || now >= last_touch + (uint64_t)slack)) {
+        *needs_rate_update = true;
+    }
+}
+
+/* Promote a held raw contact past TOUCH_DEBOUNCE_MS even when no new input
+ * arrives (still finger). g_touch_down_since is set on first raw-down. */
+static void promote_debounced_touch(uint64_t now, bool* needs_rate_update) {
+    if (g_touch_down_since == 0 ||
+        atomic_load_explicit(&g_touching, memory_order_relaxed)) {
+        return;
+    }
+    bool any_raw = any_raw_contact();
+    if (any_raw &&
+        (now - g_touch_down_since) >= (uint64_t)TOUCH_DEBOUNCE_MS) {
+        atomic_store_explicit(&g_touching, true, memory_order_relaxed);
+        atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
+        g_idle_drop_armed = false;
+        g_rate_retry_at_ms = 0;
+        *needs_rate_update = true;
+    } else if (!any_raw) {
+        g_touch_down_since = 0;
+    }
+}
+
+/* No display callback: poll interactive / power-save / brightness the
+ * old-fashioned way on timeout. Return values fold into needs_rate_update
+ * (already true for nfds==0). */
+static void poll_without_display_callback(uint64_t now) {
+    (void)checkInteractiveAndPowerSave(true);
+    (void)checkMinBrightness();
+    /* Battery sysfs only when no timerfd (should be rare) and no
+     * binder battery listener — otherwise the timerfd path owns it. */
+    if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed) &&
+        g_maintenance_timer_fd < 0) {
+        static uint64_t last_battery_read = 0;
+        if (now - last_battery_read >= 30000) {
+            last_battery_read = now;
+            (void)evaluateBatteryState(readInitialBatteryLevel());
+        }
+    }
+}
+
+/* Screen-off falling edge: reset touch state once. Touch fds stay in epoll;
+ * the kernel suppresses events while the panel is off. */
+static void handle_screen_off_edge(bool interactive, bool* last_interactive,
+                                   uint64_t now, bool* needs_rate_update) {
+    if (!interactive && *last_interactive) {
+        for (int t = 0; t < g_touch_fd_count; t++) {
+            s_touch_active_slots[t] = 0;
+            s_touch_current_slot[t] = 0;
+            s_touch_device_active[t] = false;
+        }
+        g_touch_down_since = 0;
+        g_idle_drop_armed = false;
+        g_rate_retry_at_ms = 0;
+        if (atomic_load_explicit(&g_touching, memory_order_relaxed)) {
+            atomic_store_explicit(&g_touching, false, memory_order_relaxed);
+            atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
+            *needs_rate_update = true;
+        }
+    }
+    *last_interactive = interactive;
+}
+
+static void handle_touch_fd(int device_index, uint32_t revents, uint64_t now,
+                            struct input_event* evs, size_t evs_bytes,
+                            bool* needs_rate_update) {
+    if (!(revents & EPOLLIN)) return;
+    if (device_index < 0 || device_index >= g_touch_fd_count) return;
+
+    int fd = g_touch_fds[device_index];
+    bool saw_touch_state = false;
+    bool saw_active_touch = false;
+    bool use_tracking_fallback = s_touch_tracking_fallback[device_index];
+    bool device_touching = s_touch_device_active[device_index];
+
+    /* Drain all pending events. Debounce uses monotonic `now` across epoll
+     * iterations (TOUCH_DEBOUNCE_MS is larger than a single event batch). */
+    while (true) {
+        ssize_t n = read(fd, evs, evs_bytes);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        size_t count = (size_t)n / sizeof(struct input_event);
+        for (size_t k = 0; k < count; k++) {
+            updateTouchStateFromEvent(&evs[k], device_index,
+                                      use_tracking_fallback,
+                                      &saw_touch_state,
+                                      &saw_active_touch,
+                                      &device_touching);
+        }
+    }
+
+    if (!saw_touch_state) return;
+
+    s_touch_device_active[device_index] = device_touching;
+
+    /* OR contacts across every registered device. */
+    bool any_raw = any_raw_contact();
+
+    /* Debounce: contact must persist TOUCH_DEBOUNCE_MS before engaging the
+     * active rate. */
+    if (any_raw) {
+        if (g_touch_down_since == 0)
+            g_touch_down_since = now;
+    } else {
+        g_touch_down_since = 0;
+    }
+
+    bool effective = any_raw &&
+                     g_touch_down_since != 0 &&
+                     (now - g_touch_down_since) >= (uint64_t)TOUCH_DEBOUNCE_MS;
+
+    bool old_touching = atomic_load_explicit(&g_touching, memory_order_relaxed);
+    if (effective != old_touching) {
+        atomic_store_explicit(&g_touching, effective, memory_order_relaxed);
+        atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
+        if (effective) {
+            /* New contact: cancel pending idle drop. */
+            g_idle_drop_armed = false;
+            g_rate_retry_at_ms = 0;
+        } else {
+            /* Contact ended: arm one-shot idle after slack. */
+            g_idle_drop_armed = true;
+        }
+        *needs_rate_update = true;
+    } else if (effective && saw_active_touch) {
+        /* Still effectively touching — refresh slack. */
+        atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
+        g_idle_drop_armed = false;
+    } else if (!any_raw && old_touching) {
+        atomic_store_explicit(&g_touching, false, memory_order_relaxed);
+        atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
+        g_idle_drop_armed = true;
+        *needs_rate_update = true;
+    }
+}
+
+/* Returns false if the loop should stop applying rate this iteration
+ * (shutdown was consumed). */
+static bool handle_wakeup_fd(int fd, uint32_t revents, bool* needs_rate_update) {
+    if (!(revents & EPOLLIN)) return true;
+
+    uint64_t val;
+    ssize_t n = read(fd, &val, sizeof(val));
+    if (n < 0 && errno != EINTR) {
+        LOGE("eventfd read failed: %s", strerror(errno));
+    }
+    atomic_flag_clear_explicit(&g_wakeup_pending, memory_order_release);
+    if (consumeShutdownSignal()) {
+        *needs_rate_update = false;
+        return false;
+    }
+
+    if (atomic_exchange_explicit(&g_query_task_pending, false,
+                                  memory_order_acq_rel)) {
+        queryFocusedTask();
+    }
+
+    /* Consume dirty flags set by binder callbacks. Callbacks only set the
+     * flag+wake; blocking binder queries run here. Return values drive
+     * needs_rate_update — no nested eventfd write from this thread. */
+    if (atomic_exchange_explicit(&g_interactive_dirty, false,
+                                  memory_order_acq_rel)) {
+        if (checkInteractiveAndPowerSave(true))
+            *needs_rate_update = true;
+    }
+    if (atomic_exchange_explicit(&g_brightness_dirty, false,
+                                  memory_order_acq_rel)) {
+        if (checkMinBrightness())
+            *needs_rate_update = true;
+    }
+
+    /* Foreground package / dirty-bit wake always re-evaluates rate
+     * (package change may have swapped idle/active). */
+    *needs_rate_update = true;
+    return true;
+}
+
+static void handle_uevent_fd(uint32_t revents, bool* needs_rate_update) {
+    if (!(revents & EPOLLIN)) return;
+    bool any_batt_change = false;
+    bool one_changed = false;
+    while (handleUevent(&one_changed)) {
+        if (one_changed) any_batt_change = true;
+    }
+    if (any_batt_change) *needs_rate_update = true;
+}
+
+static void handle_timer_fd(int fd, uint32_t revents, bool* needs_rate_update) {
+    if (!(revents & EPOLLIN)) return;
+    uint64_t expirations;
+    ssize_t n = read(fd, &expirations, sizeof(expirations));
+    (void)n;
+    /* Power-save and battery have no binder callback — this is the only
+     * periodic poll for them. */
+    if (checkInteractiveAndPowerSave(false))
+        *needs_rate_update = true;
+    if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed)) {
+        if (evaluateBatteryState(readInitialBatteryLevel()))
+            *needs_rate_update = true;
+    }
+}
+
+static void handle_server_fd(int fd, uint32_t revents, int epfd) {
+    if (!(revents & EPOLLIN)) return;
+    while (true) {
+        int client_fd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (client_fd < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                LOGE("accept4 failed on @dfps: %s", strerror(errno));
+            }
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* Authenticate the peer before any I/O. */
+        if (!client_authorized(client_fd)) {
+            LOGW("Rejected unauthorized @dfps client");
+            close(client_fd);
+            continue;
+        }
+
+        pthread_spin_lock(&g_client_lock);
+        if (g_client_count < MAX_CLIENTS) {
+            struct epoll_event c_ev;
+            c_ev.data.ptr = tag_fd(FD_CLIENT, client_fd);
+            c_ev.events = EPOLLIN | EPOLLRDHUP;
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &c_ev) < 0) {
+                LOGE("Failed to add client fd to epoll");
+                close(client_fd);
+            } else {
+                g_client_fds[g_client_count++] = client_fd;
+                LOGI("New socket client connected on @dfps (Total: %d)",
+                     g_client_count);
+
+                /* Send current foreground packages to new client */
+                char snap_buf[1024];
+                int snap_offset = 0;
+                for (int p = 0; p < g_last_package_count; p++) {
+                    if (p > 0) snap_buf[snap_offset++] = ' ';
+                    int len = g_last_package_prefixes[p].len;
+                    if (snap_offset + len < 1000) {
+                        memcpy(snap_buf + snap_offset,
+                               g_last_package_prefixes[p].buf, len);
+                        snap_offset += len;
+                    }
+                }
+                snap_buf[snap_offset++] = '\n';
+                send(client_fd, snap_buf, snap_offset,
+                     MSG_NOSIGNAL | MSG_DONTWAIT);
+            }
+        } else {
+            LOGW("Abstract socket clients limit reached. "
+                 "Refusing connection.");
+            close(client_fd);
+        }
+        pthread_spin_unlock(&g_client_lock);
+    }
+}
+
+static void handle_client_fd(int fd, uint32_t revents, uint64_t now, int epfd) {
+    if (!(revents & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))) return;
+
+    char buf[128];
+    ssize_t n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+    bool should_close = false;
+
+    if (n > 0) {
+        buf[n] = '\0';
+        size_t l = (size_t)n;
+        while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r'))
+            buf[--l] = '\0';
+
+        if (strcmp(buf, "STATUS") == 0) {
+            /* Post-auth diagnostics snapshot. */
+            uint64_t up = (g_start_time ? (now - g_start_time) : 0);
+            char health[256];
+            int hl = snprintf(health, sizeof(health),
+                "idle=%d active=%d last=%d interactive=%d powersave=%d "
+                "lowbatt=%d minbright=%d callback=%d uptime_ms=%llu\n",
+                (int)atomic_load_explicit(&g_curr_idle_rate, memory_order_relaxed),
+                (int)atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed),
+                (int)atomic_load_explicit(&g_last_set_rate, memory_order_relaxed),
+                atomic_load_explicit(&g_screen_interactive, memory_order_relaxed) ? 1 : 0,
+                atomic_load_explicit(&g_power_save_mode, memory_order_relaxed) ? 1 : 0,
+                atomic_load_explicit(&g_low_battery_mode, memory_order_relaxed) ? 1 : 0,
+                atomic_load_explicit(&g_min_brightness_clamp, memory_order_relaxed) ? 1 : 0,
+                atomic_load_explicit(&g_display_callback_active, memory_order_relaxed) ? 1 : 0,
+                (unsigned long long)(up));
+            if (send(fd, health,
+                     (size_t)hl < sizeof(health) ? (size_t)hl
+                                                 : sizeof(health) - 1,
+                     MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
+                errno != EAGAIN) {
+                /* Client vanished mid-send; drop below. */
+                should_close = true;
+            }
+        } else {
+            /* Unknown command from an authed client -> drop. */
+            should_close = true;
+        }
+    } else {
+        /* Clean EOF (n == 0) or a hard read error drops the client;
+         * EAGAIN/EWOULDBLOCK/EINTR are transient. */
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            should_close = false;
+        else
+            should_close = true;
+    }
+
+    if (!should_close) return;
+
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+    pthread_spin_lock(&g_client_lock);
+    for (int j = 0; j < g_client_count; j++) {
+        if (g_client_fds[j] == fd) {
+            g_client_fds[j] = g_client_fds[g_client_count - 1];
+            g_client_count--;
+            LOGI("Socket client disconnected from @dfps "
+                 "(Remaining: %d)", g_client_count);
+            break;
+        }
+    }
+    pthread_spin_unlock(&g_client_lock);
+}
+
+static void apply_rate_if_needed(uint64_t now, bool needs_rate_update) {
+    if (!needs_rate_update) return;
+
+    bool settled = updateRateState(now);
+    if (settled) {
+        g_rate_retry_at_ms = 0;
+        /* Disarm one-shot idle drop only once we are past slack and
+         * not touching — i.e. the idle transition had a chance to run.
+         * If still inside slack, keep armed so the timeout fires. */
+        if (g_idle_drop_armed &&
+            !atomic_load_explicit(&g_touching, memory_order_relaxed) &&
+            g_touch_down_since == 0) {
+            uint64_t last_touch = atomic_load_explicit(
+                &g_last_touch_time, memory_order_relaxed);
+            int32_t slack = atomic_load_explicit(
+                &g_touch_slack_ms, memory_order_relaxed);
+            if (last_touch == 0 || slack <= 0 ||
+                now >= last_touch + (uint64_t)slack) {
+                g_idle_drop_armed = false;
+            }
+        }
+    } else {
+        /* SF apply failed — single deferred retry, not a busy loop on
+         * every netlink wake. */
+        g_rate_retry_at_ms = now + 250;
+    }
+}
+
 void* touchListenerThread(void* arg) {
     (void)arg;
 
@@ -277,8 +660,8 @@ void* touchListenerThread(void* arg) {
         if (g_inotify_fd >= 0) close(g_inotify_fd);
         if (g_server_fd >= 0) close(g_server_fd);
         if (g_wakeup_fd >= 0) close(g_wakeup_fd);
-    if (g_uevent_fd >= 0) close(g_uevent_fd);
-    if (g_maintenance_timer_fd >= 0) close(g_maintenance_timer_fd);
+        if (g_uevent_fd >= 0) close(g_uevent_fd);
+        if (g_maintenance_timer_fd >= 0) close(g_maintenance_timer_fd);
         for (int i = 0; i < g_touch_fd_count; i++) close(g_touch_fds[i]);
         return NULL;
     }
@@ -392,75 +775,32 @@ void* touchListenerThread(void* arg) {
         }
 
         now = getNowMs();
-        /* Timeout (nfds==0) is touch-debounce promote or touch-slack expiry —
-         * both need a rate re-eval. Event-driven paths set the flag only when
-         * something rate-relevant actually changed. */
+        /* Timeout (nfds==0): debounce promote, one-shot idle-drop after slack,
+         * or a deferred SF retry. Uevent/netlink must NOT force rate re-eval —
+         * that was the thrash root cause (recvfrom wakes with timeout=-1). */
         bool needs_rate_update = (nfds == 0);
-
-        /* Promote a held raw contact past TOUCH_DEBOUNCE_MS even when no new
-         * input events arrive (still finger). g_touch_down_since is set on
-         * first raw-down; getPollTimeout wakes us when the window elapses. */
-        if (g_touch_down_since != 0 &&
-            !atomic_load_explicit(&g_touching, memory_order_relaxed)) {
-            bool any_raw = false;
-            for (int t = 0; t < g_touch_fd_count; t++) {
-                if (s_touch_device_active[t]) {
-                    any_raw = true;
-                    break;
-                }
-            }
-            if (any_raw &&
-                (now - g_touch_down_since) >= (uint64_t)TOUCH_DEBOUNCE_MS) {
-                atomic_store_explicit(&g_touching, true, memory_order_relaxed);
-                atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
-                needs_rate_update = true;
-            } else if (!any_raw) {
-                g_touch_down_since = 0;
-            }
+        if (!needs_rate_update && g_rate_retry_at_ms != 0 &&
+            now >= g_rate_retry_at_ms) {
+            needs_rate_update = true;
         }
+
+        maybe_arm_idle_rate_update(now, &needs_rate_update);
+        promote_debounced_touch(now, &needs_rate_update);
 
         if (nfds == 0) {
             bool cb_active = atomic_load_explicit(&g_display_callback_active,
                                                 memory_order_relaxed);
             if (!cb_active) {
-                /* No display callback: poll interactive / power-save /
-                 * brightness the old-fashioned way. Return values fold into
-                 * needs_rate_update (already true for nfds==0). */
-                (void)checkInteractiveAndPowerSave(true);
-                (void)checkMinBrightness();
-                /* Battery sysfs only when no timerfd (should be rare) and no
-                 * binder battery listener — otherwise the timerfd path owns it. */
-                if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed) &&
-                    g_maintenance_timer_fd < 0) {
-                    static uint64_t last_battery_read = 0;
-                    if (now - last_battery_read >= 30000) {
-                        last_battery_read = now;
-                        (void)evaluateBatteryState(readInitialBatteryLevel());
-                    }
-                }
+                /* cb_active: touch-slack / debounce timeout only. Power-save
+                 * and battery are owned exclusively by FD_TIMER — no binder/sysfs. */
+                poll_without_display_callback(now);
             }
-            /* cb_active: touch-slack / debounce timeout only. Power-save and
-             * battery are owned exclusively by FD_TIMER — no binder/sysfs. */
         }
 
-        /* Handle screen-off edge: reset touch state once. Touch fds stay in
-         * epoll; the kernel suppresses events while the panel is off. */
         bool interactive = atomic_load_explicit(&g_screen_interactive,
-                                                  memory_order_acquire);
-        if (!interactive && last_interactive) {
-            for (int t = 0; t < g_touch_fd_count; t++) {
-                s_touch_active_slots[t] = 0;
-                s_touch_current_slot[t] = 0;
-                s_touch_device_active[t] = false;
-            }
-            g_touch_down_since = 0;
-            if (atomic_load_explicit(&g_touching, memory_order_relaxed)) {
-                atomic_store_explicit(&g_touching, false, memory_order_relaxed);
-                atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
-                needs_rate_update = true;
-            }
-        }
-        last_interactive = interactive;
+                                              memory_order_acquire);
+        handle_screen_off_edge(interactive, &last_interactive, now,
+                                &needs_rate_update);
 
         /* Dispatch epoll events */
         for (int i = 0; i < nfds; i++) {
@@ -470,125 +810,14 @@ void* touchListenerThread(void* arg) {
             uint32_t revents = events[i].events;
 
             if (kind == FD_TOUCH) {
-                if (revents & EPOLLIN) {
-                    /* tagged = device index (see EPOLL_CTL_ADD above). */
-                    int device_index = tagged;
-                    if (device_index < 0 || device_index >= g_touch_fd_count)
-                        continue;
-                    int fd = g_touch_fds[device_index];
-                    bool saw_touch_state = false;
-                    bool saw_active_touch = false;
-                    bool use_tracking_fallback =
-                        s_touch_tracking_fallback[device_index];
-                    bool device_touching = s_touch_device_active[device_index];
-
-                    /* Drain all pending events. Debounce uses monotonic `now`
-                     * across epoll iterations (TOUCH_DEBOUNCE_MS is larger
-                     * than a single event batch). */
-                    while (true) {
-                        ssize_t n = read(fd, evs, sizeof(evs));
-                        if (n <= 0) {
-                            if (n < 0 && errno == EINTR) continue;
-                            break;
-                        }
-                        size_t count = (size_t)n / sizeof(struct input_event);
-                        for (size_t k = 0; k < count; k++) {
-                            updateTouchStateFromEvent(&evs[k], device_index,
-                                                      use_tracking_fallback,
-                                                      &saw_touch_state,
-                                                      &saw_active_touch,
-                                                      &device_touching);
-                        }
-                    }
-
-                    if (saw_touch_state) {
-                        s_touch_device_active[device_index] = device_touching;
-
-                        /* OR contacts across every registered device. */
-                        bool any_raw = false;
-                        for (int t = 0; t < g_touch_fd_count; t++) {
-                            if (s_touch_device_active[t]) {
-                                any_raw = true;
-                                break;
-                            }
-                        }
-
-                        /* Debounce: contact must persist TOUCH_DEBOUNCE_MS
-                         * before engaging the active rate. */
-                        if (any_raw) {
-                            if (g_touch_down_since == 0)
-                                g_touch_down_since = now;
-                        } else {
-                            g_touch_down_since = 0;
-                        }
-
-                        bool effective = any_raw &&
-                                         g_touch_down_since != 0 &&
-                                         (now - g_touch_down_since) >=
-                                             (uint64_t)TOUCH_DEBOUNCE_MS;
-
-                        bool old_touching = atomic_load_explicit(&g_touching,
-                                                                  memory_order_relaxed);
-                        if (effective != old_touching) {
-                            atomic_store_explicit(&g_touching, effective,
-                                                  memory_order_relaxed);
-                            atomic_store_explicit(&g_last_touch_time, now,
-                                                  memory_order_relaxed);
-                            needs_rate_update = true;
-                        } else if (effective && saw_active_touch) {
-                            /* Still effectively touching — refresh slack. */
-                            atomic_store_explicit(&g_last_touch_time, now,
-                                                  memory_order_relaxed);
-                        } else if (!any_raw && old_touching) {
-                            atomic_store_explicit(&g_touching, false,
-                                                  memory_order_relaxed);
-                            atomic_store_explicit(&g_last_touch_time, now,
-                                                  memory_order_relaxed);
-                            needs_rate_update = true;
-                        }
-                    }
-                }
+                handle_touch_fd(tagged, revents, now, evs, sizeof(evs),
+                              &needs_rate_update);
                 continue;
             }
 
             if (kind == FD_WAKEUP) {
-                int fd = tagged;
-                if (revents & EPOLLIN) {
-                    uint64_t val;
-                    ssize_t n = read(fd, &val, sizeof(val));
-                    if (n < 0 && errno != EINTR) {
-                        LOGE("eventfd read failed: %s", strerror(errno));
-                    }
-                    atomic_flag_clear_explicit(&g_wakeup_pending, memory_order_release);
-                    if (consumeShutdownSignal()) {
-                        needs_rate_update = false;
-                        continue;
-                    }
-
-                    if (atomic_exchange_explicit(&g_query_task_pending, false,
-                                                  memory_order_acq_rel)) {
-                        queryFocusedTask();
-                    }
-
-                    /* Consume dirty flags set by binder callbacks. Callbacks
-                     * only set the flag+wake; blocking binder queries run
-                     * here. Return values drive needs_rate_update — no nested
-                     * eventfd write from this thread. */
-                    if (atomic_exchange_explicit(&g_interactive_dirty, false,
-                                                  memory_order_acq_rel)) {
-                        if (checkInteractiveAndPowerSave(true))
-                            needs_rate_update = true;
-                    }
-                    if (atomic_exchange_explicit(&g_brightness_dirty, false,
-                                                  memory_order_acq_rel)) {
-                        if (checkMinBrightness())
-                            needs_rate_update = true;
-                    }
-
-                    /* Foreground package / dirty-bit wake always re-evaluates
-                     * rate (package change may have swapped idle/active). */
-                    needs_rate_update = true;
-                }
+                if (!handle_wakeup_fd(tagged, revents, &needs_rate_update))
+                    continue;
                 continue;
             }
 
@@ -601,172 +830,27 @@ void* touchListenerThread(void* arg) {
             }
 
             if (kind == FD_UEVENT) {
-                if (revents & EPOLLIN) {
-                    bool any_batt_change = false;
-                    bool one_changed = false;
-                    while (handleUevent(&one_changed)) {
-                        if (one_changed) any_batt_change = true;
-                    }
-                    if (any_batt_change) needs_rate_update = true;
-                }
+                handle_uevent_fd(revents, &needs_rate_update);
                 continue;
             }
 
             if (kind == FD_TIMER) {
-                int fd = tagged;
-                if (revents & EPOLLIN) {
-                    uint64_t expirations;
-                    ssize_t n = read(fd, &expirations, sizeof(expirations));
-                    (void)n;
-                    /* Power-save and battery have no binder callback — this
-                     * is the only periodic poll for them. */
-                    if (checkInteractiveAndPowerSave(false))
-                        needs_rate_update = true;
-                    if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed)) {
-                        if (evaluateBatteryState(readInitialBatteryLevel()))
-                            needs_rate_update = true;
-                    }
-                }
+                handle_timer_fd(tagged, revents, &needs_rate_update);
                 continue;
             }
 
             if (kind == FD_SERVER) {
-                int fd = tagged;
-                if (revents & EPOLLIN) {
-                    while (true) {
-                        int client_fd = accept4(fd, NULL, NULL,
-                                                SOCK_NONBLOCK | SOCK_CLOEXEC);
-                        if (client_fd < 0) {
-                            if (errno != EAGAIN && errno != EWOULDBLOCK &&
-                                errno != EINTR) {
-                                LOGE("accept4 failed on @dfps: %s", strerror(errno));
-                            }
-                            if (errno == EINTR) continue;
-                            break;
-                        }
-
-                        /* Authenticate the peer before any I/O. */
-                        if (!client_authorized(client_fd)) {
-                            LOGW("Rejected unauthorized @dfps client");
-                            close(client_fd);
-                            continue;
-                        }
-
-                        pthread_spin_lock(&g_client_lock);
-                        if (g_client_count < MAX_CLIENTS) {
-                            struct epoll_event c_ev;
-                            c_ev.data.ptr = tag_fd(FD_CLIENT, client_fd);
-                            c_ev.events = EPOLLIN | EPOLLRDHUP;
-                            if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &c_ev) < 0) {
-                                LOGE("Failed to add client fd to epoll");
-                                close(client_fd);
-                            } else {
-                                g_client_fds[g_client_count++] = client_fd;
-                                LOGI("New socket client connected on @dfps (Total: %d)",
-                                     g_client_count);
-
-                                /* Send current foreground packages to new client */
-                                char snap_buf[1024];
-                                int snap_offset = 0;
-                                for (int p = 0; p < g_last_package_count; p++) {
-                                    if (p > 0) snap_buf[snap_offset++] = ' ';
-                                    int len = g_last_package_prefixes[p].len;
-                                    if (snap_offset + len < 1000) {
-                                        memcpy(snap_buf + snap_offset,
-                                               g_last_package_prefixes[p].buf, len);
-                                        snap_offset += len;
-                                    }
-                                }
-                                snap_buf[snap_offset++] = '\n';
-                                send(client_fd, snap_buf, snap_offset,
-                                     MSG_NOSIGNAL | MSG_DONTWAIT);
-                            }
-                        } else {
-                            LOGW("Abstract socket clients limit reached. "
-                                 "Refusing connection.");
-                            close(client_fd);
-                        }
-                        pthread_spin_unlock(&g_client_lock);
-                    }
-                }
+                handle_server_fd(tagged, revents, epfd);
                 continue;
             }
 
             if (kind == FD_CLIENT) {
-                int fd = tagged;
-                if (revents & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-                    char buf[128];
-                    ssize_t n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
-                    bool should_close = false;
-
-                    if (n > 0) {
-                        buf[n] = '\0';
-                        size_t l = (size_t)n;
-                        while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r'))
-                            buf[--l] = '\0';
-
-                        if (strcmp(buf, "STATUS") == 0) {
-                            /* Post-auth diagnostics snapshot. */
-                            uint64_t up = (g_start_time ? (now - g_start_time) : 0);
-                            char health[256];
-                            int hl = snprintf(health, sizeof(health),
-                                "idle=%d active=%d last=%d interactive=%d powersave=%d "
-                                "lowbatt=%d minbright=%d callback=%d uptime_ms=%llu\n",
-                                (int)atomic_load_explicit(&g_curr_idle_rate, memory_order_relaxed),
-                                (int)atomic_load_explicit(&g_curr_active_rate, memory_order_relaxed),
-                                (int)atomic_load_explicit(&g_last_set_rate, memory_order_relaxed),
-                                atomic_load_explicit(&g_screen_interactive, memory_order_relaxed) ? 1 : 0,
-                                atomic_load_explicit(&g_power_save_mode, memory_order_relaxed) ? 1 : 0,
-                                atomic_load_explicit(&g_low_battery_mode, memory_order_relaxed) ? 1 : 0,
-                                atomic_load_explicit(&g_min_brightness_clamp, memory_order_relaxed) ? 1 : 0,
-                                atomic_load_explicit(&g_display_callback_active, memory_order_relaxed) ? 1 : 0,
-                                (unsigned long long)(up));
-                            if (send(fd, health,
-                                     (size_t)hl < sizeof(health) ? (size_t)hl
-                                                                 : sizeof(health) - 1,
-                                     MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
-                                errno != EAGAIN) {
-                                /* Client vanished mid-send; drop below. */
-                                should_close = true;
-                            }
-                        } else {
-                            /* Unknown command from an authed client -> drop. */
-                            should_close = true;
-                        }
-                    } else {
-                        /* Clean EOF (n == 0) or a hard read error drops the
-                         * client; EAGAIN/EWOULDBLOCK/EINTR are transient. */
-                        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                                     errno == EINTR))
-                            should_close = false;
-                        else
-                            should_close = true;
-                    }
-
-                    if (should_close) {
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                        close(fd);
-                        pthread_spin_lock(&g_client_lock);
-                        for (int j = 0; j < g_client_count; j++) {
-                            if (g_client_fds[j] == fd) {
-                                g_client_fds[j] = g_client_fds[g_client_count - 1];
-                                g_client_count--;
-                                LOGI("Socket client disconnected from @dfps "
-                                     "(Remaining: %d)", g_client_count);
-                                break;
-                            }
-                        }
-                        pthread_spin_unlock(&g_client_lock);
-                    }
-                }
+                handle_client_fd(tagged, revents, now, epfd);
                 continue;
             }
         }
 
-        /* Apply rate update if any event triggered a state change */
-        if (needs_rate_update) {
-            updateRateState(now);
-        }
+        apply_rate_if_needed(now, needs_rate_update);
     }
 
     close(epfd);
@@ -791,6 +875,8 @@ void* touchListenerThread(void* arg) {
     }
     g_touch_fd_count = 0;
     g_touch_down_since = 0;
+    g_idle_drop_armed = false;
+    g_rate_retry_at_ms = 0;
     atomic_store_explicit(&g_touching, false, memory_order_relaxed);
     return NULL;
 }
