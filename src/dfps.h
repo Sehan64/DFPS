@@ -546,6 +546,9 @@ bool    evaluateBatteryState(int32_t level);
  * *state_changed when a battery evaluation mutated rate-relevant state. */
 bool    handleUevent(bool* state_changed);
 
+/* main.c */
+void setupUeventSocket(void);
+
 /* touch.c */
 bool  consumeShutdownSignal(void);
 void  findTouchscreens(void);

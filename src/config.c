@@ -416,6 +416,12 @@ void loadConfig(void) {
         atomic_store_explicit(&g_power_save_mode, false, memory_order_release);
         atomic_store_explicit(&g_low_battery_mode, false, memory_order_release);
     }
+    if (!old_battery_saver && temp.battery_saver) {
+        /* Battery saver just turned on at runtime (config hot-reload): the
+         * uevent socket was skipped at startup, so (re)create it now for fast
+         * battery-level updates. setupUeventSocket() is idempotent. */
+        setupUeventSocket();
+    }
     atomic_store_explicit(&g_low_battery_threshold, temp.low_battery_threshold, memory_order_release);
     atomic_store_explicit(&g_power_save_max_rate, temp.power_save_max_rate, memory_order_release);
 

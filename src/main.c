@@ -500,14 +500,16 @@ static bool associateClientClasses(void) {
 }
 
 __attribute__((cold))
-static void setupUeventSocket(void) {
+void setupUeventSocket(void) {
     if (!g_root_mode) return;
+    if (g_uevent_fd >= 0) return;  /* idempotent; also (re)created on saver-on toggle */
 
-    /* The uevent netlink socket exists only to deliver fast battery-level
-     * updates. Battery level only drives the refresh rate when battery saver
-     * is enabled (config), and the 30s maintenance timerfd already probes it
-     * otherwise — so skip the socket (and its recvfrom wakeups) entirely when
-     * saver is off. */
+    /* The uevent netlink socket delivers fast battery-level updates. Battery
+     * level only drives the refresh rate when battery saver is enabled (config),
+     * and the 30s maintenance timerfd probes it when saver is on (handle_timer_fd),
+     * so when saver is off at startup we skip the socket (and its recvfrom
+     * wakeups) entirely. When saver is toggled on at runtime, loadConfig() calls
+     * this again to (re)create it. Idempotent: returns early if already open. */
     if (!atomic_load_explicit(&g_battery_saver, memory_order_relaxed)) {
         LOGI("Battery saver disabled: skipping netlink uevent listener");
         return;
