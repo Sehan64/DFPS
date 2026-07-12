@@ -1,52 +1,75 @@
 # Building
 
-DFPS is plain C11 plus Android system libraries. The build is driven by the
-top-level `Makefile`.
+Plain C11 (`gnu11`) against Android system libraries. Top-level `Makefile`
+targets Termux native builds and NDK-style cross builds.
 
 ## Requirements
 
-- `clang`
-- `make`
-- `libc`, `libdl`, and `liblog` headers/libs from Termux or the Android NDK
-- `src/resolver_bytes.h`
+- `clang`, `make`
+- headers/libs for `libc`, `libdl` (and `liblog` at runtime on device)
+- `src/resolver_bytes.h` — embedded Java helper used at first boot to resolve
+  Binder transaction codes (see below)
 
-## Common targets
+Termux:
 
 ```bash
-make          # release build
-make debug    # ASan + UBSan build
-make check    # syntax-only check
-make test     # build and run the regression tests
-make install  # copy binary to /data/local/tmp/dfps/bin/dfps
+pkg install clang make
+make
 ```
 
-## Build profiles
+## Targets
 
-- `release` is the default. It uses `-O3`, LTO, and an arm64 baseline.
-- `debug` enables sanitizers and keeps symbols.
+| Target | Purpose |
+|---|---|
+| `make` / `make all` | Release binary → `bin/<abi>/dfps` |
+| `make debug` | ASan + UBSan, `-O0 -g3`, no LTO |
+| `make check` | Syntax-only (`-fsyntax-only`) |
+| `make test` | Config / reload regression tests under `tests/` |
+| `make test SAN=1` | Same tests with ASan/UBSan |
+| `make install` | Copy release binary to `/data/local/tmp/dfps/bin/dfps` |
+| `make clean` | Remove build artifacts |
+
+ABI is detected from `uname -m` (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
+
+## Profiles
+
+- **release** (default): `-O3`, LTO, `-march` baseline for the ABI (not
+  `-march=native`), stack protector, FORTIFY, full RELRO/NOW; stripped.
+- **debug**: sanitizers and symbols; not for production devices without care.
+
+Overrides:
+
+```bash
+make CFLAGS_EXTRA='-DFOO' LDFLAGS_EXTRA=...
+make DFP_BUILD_STAMP=local-dev
+```
+
+`DFP_BUILD_STAMP` defaults to `git describe --always --dirty --tags` and is
+embedded for `--version`.
 
 ## `resolver_bytes.h`
 
-The daemon embeds a small Java helper JAR as `src/resolver_bytes.h`. It is used
-to resolve Binder transaction codes that are not fixed across Android versions.
+The daemon embeds a small `app_process` helper JAR as a C byte array. On first
+run (or cache miss) it resolves ROM-specific Binder transaction codes and
+writes a fingerprint-scoped cache under `/data/local/tmp/dfps/`.
 
-You can:
+- Ship a real generated header from release packaging.
+- A stub is enough for `make check` / host-side syntax only.
+- Runtime without a real helper fails when core AM codes cannot be resolved.
 
-- copy a generated header from a release artifact
-- generate one from the helper JAR
-- stub it for syntax-only checks
+## Tests
 
-Runtime startup still requires a real helper. A stub is only useful for
-compilation checks.
+```bash
+make test
+# or
+make test SAN=1
+```
 
-## Test build
-
-`make test` compiles the regression tests under `tests/` (linked against the
-real source so they exercise `loadConfig()` / `loadModesMap()` and the
-config globals) and runs them. The tests write temporary files under
-`/data/local/tmp/dfps/`, which must already exist.
+Tests compile against real `config.c` / `rate.c` / … with a writable temp dir
+for `DFPS_CONFIG_PATH` / `DFPS_MODES_MAP_PATH`. They do not start the full
+daemon or require root. Binder symbols are stubbed in `tests/test_stubs.c`.
 
 ## Cross builds
 
-The Makefile auto-selects the ABI from `uname -m`. On a desktop host, set the
-NDK toolchain in `PATH` and build normally with `make`.
+Put the NDK `clang` for the target ABI first in `PATH`, then `make` on the
+host. Prefer building on-device (Termux) when possible to avoid ABI mismatch.

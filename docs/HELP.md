@@ -1,100 +1,91 @@
-# Dynamic refresh rate configuration help
+# Configuration help
 
-> Adapted from the upstream `yc9559/dfps` help
-> (`magisk/config/dfps_help_en.md`, Apache-2.0). This fork (**dfpsd**) has
-> diverged in a few important ways — see
-> [Divergences from upstream](#divergences-from-upstream-yc9559dfps) at the end.
-> Where this document and upstream disagree, **this document describes dfpsd
-> behavior**.
->
-> For the full key/value reference and file format, see
-> [`CONFIGURATION.md`](./CONFIGURATION.md).
+Practical guide to `dfps.conf` options. Full syntax and reload rules:
+[`CONFIGURATION.md`](./CONFIGURATION.md).
+
+This fork (dfpsd) diverges from upstream `yc9559/dfps` in several places —
+see [Divergences](#divergences-from-upstream-yc9559dfps).
+
+## Getting a good first setup
+
+1. Let the module installer write `modes.map` from `dumpsys SurfaceFlinger`,
+   or hand-write Hz → SF id pairs that match your panel.
+2. Set `defaultIdle` / `defaultActive` to rates that exist in `modes.map`.
+3. Add per-app rules only where defaults feel wrong (games, video, launchers).
+4. Leave `batterySaver` / brightness clamp off until the basics work, then
+   enable them if you care about OLED shift or battery.
 
 ## Feature options
 
-### `touchSlackMs`
+### `touchSlackMs` (default `4000`)
 
-While you interact with the screen, the refresh rate switches to
-`defaultActive`, then waits `touchSlackMs` milliseconds after the last input
-before dropping back to `defaultIdle`.
+After the last touch, keep the **active** rate for this many milliseconds
+before dropping to idle. Avoids thrashing the panel on short gestures.
 
-This delay avoids rapidly toggling the refresh rate, which would waste power
-through switching overhead.
+- Valid range `0`–`60000`; out-of-range values fall back to `4000`.
+- Contacts shorter than 50 ms (hard-coded debounce) never engage active rate,
+  so phantom multitouch noise does not ramp the panel.
 
-- **Default:** `4000`
-- **Valid range:** `0`–`60000` (values outside this range are clamped back to
-  `4000`)
+### `enableMinBrightness` / `minBrightnessThreshold`
 
-### `enableMinBrightness`
+On OLED panels, rate switches at very low brightness can cause a visible
+brightness or color shift. When enabled, brightness ≤ `minBrightnessThreshold`
+(percent, `0`–`100`) forces the **minimum physical** rate from `modes.map`
+(or `defaultIdle` if the min is unknown) and suppresses touch boost.
 
-On OLED panels, switching the refresh rate at very low brightness can cause a
-visible brightness/color shift that looks bad. `enableMinBrightness` clamps the
-daemon to the minimum rate and stops touch-boosting whenever the screen
-brightness drops below `minBrightnessThreshold`.
-
-- **Default:** `false`
-- **Threshold:** `minBrightnessThreshold` is a **percentage** (`0`–`100`), e.g.
-  `minBrightnessThreshold = 10` means "clamp when brightness is below 10%".
+Default: off / threshold `0`.
 
 ### `enableFrameRateFlex`
 
-dfpsd always sets the refresh rate through the SurfaceFlinger transaction
-`1035`, using `modes.map` to translate a target Hz into the SurfaceFlinger
-config ID. `enableFrameRateFlex` additionally toggles SurfaceFlinger transaction
-`1036` (a "frame rate flex" policy) on some devices that block cross-group
-switching.
+dfpsd always drives the panel via SurfaceFlinger vendor transaction **`1035`**
+and `modes.map`. Setting this true also toggles transaction **`1036`**
+(“frame-rate flex”) on ROMs that block cross-group switches. Harmless no-op
+when the ROM rejects `1036` (logged once as a warning).
 
-- **Default:** `false`
-- There is **no** native `PEAK_REFRESH_RATE` code path in dfpsd. See
-  [Divergences](#divergences-from-upstream-yc9559dfps).
+There is **no** native `PEAK_REFRESH_RATE` settings path in this fork.
 
-## Battery saver (dfpsd addition)
+## Battery saver
 
-These keys are not present in upstream dfps:
+Only active when `batterySaver = true`:
 
-- `batterySaver` (`true`/`false`) — when on, respect the system power-save mode
-  and low-battery mode.
-- `lowBatteryThreshold` (`0`–`100`) — battery percentage that enters low-battery
-  mode.
-- `powerSaveMaxRate` (`Hz`) — maximum active rate while power-saving is active.
+| Key | Role |
+|---|---|
+| `lowBatteryThreshold` | Enter low-battery mode at this battery % (exit at threshold+2 hysteresis) |
+| `powerSaveMaxRate` | Cap applied to the **active** rate while system power-save **or** low-battery is on |
 
-They have no effect unless `batterySaver = true`.
+Idle rate is not capped. Power-save mode is polled every 30 s (no Binder
+callback for it). Battery level comes from Binder listener, netlink uevent,
+or a cached sysfs path.
 
-## Per-app configuration
-
-Format:
+## Per-app rules
 
 ```text
-packageName = idleValue activeValue
+packageName = idleHz activeHz
 ```
 
-- `idleValue` — refresh rate (Hz) used when the app is shown but not being
-  touched.
-- `activeValue` — refresh rate (Hz) used while you are touching the screen.
-- `-1` on either side means **inherit the current default** (`defaultIdle` /
-  `defaultActive`) for that side.
-
-Example:
+- `-1` inherits the current global default for that side.
+- Exact package match only (case-sensitive); max 256 rules.
+- No upstream `-` (offscreen) or `*` (default) tokens — use `offscreenRate`
+  and the global defaults instead.
 
 ```text
 com.miHoYo.Yuanshen = 60 60
-com.hypergryph.arknights = 60 60
-com.android.launcher3 = 60 60
+com.android.launcher3 = 60 90
+com.example.reader = 30 -1
 ```
 
-The rule table is capped at 256 entries; lookups are exact and case-sensitive.
+## Offscreen
 
-> **Note:** dfpsd does **not** use the upstream `-` (offscreen) or `*` (default)
-> rule tokens. Offscreen behavior is controlled by the global `offscreenRate`
-> key instead (see [`CONFIGURATION.md`](./CONFIGURATION.md)).
+`offscreenRate = N` forces `N` Hz while the screen is not interactive.
+`-1` (default) means “do not drive the panel while off.”
 
 ## Divergences from upstream `yc9559/dfps`
 
-| Area | Upstream `yc9559/dfps` | dfpsd (this fork) |
+| Area | Upstream | dfpsd |
 |---|---|---|
-| Brightness scale | `enableMinBrightness` is `0`–`255` (device-specific table) | `minBrightnessThreshold` is a **percentage** `0`–`100` |
-| Rate-switch method | `useSfBackdoor`: `0` = native `PEAK_REFRESH_RATE` (value ≥ 20 Hz), `1` = SurfaceFlinger backdoor (value < 20 = config index) | Always SurfaceFlinger `1035` + `modes.map`; `enableFrameRateFlex` toggles `1036`. **No** native `PEAK_REFRESH_RATE` path. |
-| Per-app syntax | `packageName idle active` (space-separated) | `packageName = idle active` (`=` separated) |
-| Special tokens | `-` = offscreen rule, `*` = default rule, `-1` = system default | No `-`/`*` tokens; offscreen = global `offscreenRate`; `-1` = inherit fork default |
-| Battery saver | not present | `batterySaver` / `lowBatteryThreshold` / `powerSaveMaxRate` added |
-| Implementation | C++ (spdlog / scnlib) | C (POSIX, no external runtime deps) |
+| Brightness | `enableMinBrightness` 0–255 device table | `minBrightnessThreshold` as **percent** 0–100 |
+| Rate method | Optional `PEAK_REFRESH_RATE` vs SF backdoor | Always SF `1035` + `modes.map`; `enableFrameRateFlex` → `1036` |
+| Per-app syntax | `pkg idle active` (spaces) | `pkg = idle active` |
+| Special tokens | `-` offscreen, `*` default | Globals only; `-1` inherits fork defaults |
+| Battery | not present | `batterySaver` / `lowBatteryThreshold` / `powerSaveMaxRate` |
+| Implementation | C++ | C11, no external runtime deps |

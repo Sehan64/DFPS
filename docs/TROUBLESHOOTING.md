@@ -1,52 +1,83 @@
 # Troubleshooting
 
-Use `logcat -s DFPS_Daemon` first. Most failures are visible there.
+Start here:
 
-## Daemon does not start
+```bash
+logcat -s DFPS_Daemon
+su -c 'pgrep -af /data/local/tmp/dfps/dfps'
+su -c '/data/local/tmp/dfps/dfps --version'
+```
 
-- Check that the module is installed and `/data/local/tmp/dfps/dfps` exists.
-- Verify `libbinder_ndk.so` is present on the device.
-- If the log says the singleton socket is in use, stop the other DFPS copy
-  first.
-- If transaction-code resolution fails, the device build likely changed and the
-  cache needs regeneration.
+Enable `DEBUG = true` in `dfps.conf` for info/warn detail (hot-reloaded).
 
-## Daemon exits immediately
+## Does not start
 
-- Look for Binder service death messages.
-- Confirm `ActivityManager`, `PowerManager`, `SurfaceFlinger`, and
-  `DisplayManager` are available.
-- Reboot after a clean reinstall if a stale process is still registered.
+| Log / symptom | Action |
+|---|---|
+| `@dfps already in use` | `pkill -TERM -f dfps` and retry; only one instance |
+| `libbinder_ndk.so open error` | Device too old or broken system image |
+| `Core … transaction code mapping failed` | Resolver JAR / cache problem; delete tx cache under `/data/local/tmp/dfps/` and restart so the helper re-runs; confirm `app_process` works |
+| Binary missing | Reinstall module; check `/data/local/tmp/dfps/dfps` |
 
-## Refresh rate does not change
+## Exits immediately after start
 
-- Confirm the device has more than one refresh rate in `modes.map`.
-- Confirm `dfps.conf` has sensible `defaultIdle` and `defaultActive` values.
-- Check that touch input is detected on rooted devices.
-- If brightness clamp or battery saver is enabled, they may override the active
-  rate.
+- Binder death of ActivityManager / SurfaceFlinger / DisplayManager / Power
+- Incomplete service map after a ROM update
+- SELinux denials (check `dmesg` / `logcat` for avc)
 
-## Touch input does not work
+Reboot after clean reinstall if a stale observer registration confuses the
+next start.
 
-- Root mode is required for `/dev/input/event*`.
-- Some devices need SELinux or input-device access tweaks.
-- If the device screen is off, the kernel may suppress touch events.
+## Refresh rate never changes
 
-## Foreground app tracking looks wrong
+1. `modes.map` has ≥1 valid row that matches real SF ids  
+   (`dumpsys SurfaceFlinger` / display modes).
+2. `STATUS` shows expected `idle`/`active` and a changing `last`.
+3. Touch path: root, devices registered in log, screen interactive, hold
+   longer than 50 ms debounce, wait out `touchSlackMs` for idle drop.
+4. Overrides: `minbright=1` or `powersave`/`lowbatt=1` with a low cap.
+5. OEM may ignore SF tx `1035` — try `enableFrameRateFlex = true` for `1036`.
 
-- Use the `@dfps` socket to inspect the current foreground list.
-- Check that `IProcessObserver` is resolving correctly.
-- On some ROMs, task names may be process names rather than package names.
+Missing/empty `modes.map` after a good load **keeps** the old map; first boot
+with no map cannot switch until a valid file appears.
 
-## Battery or brightness behavior looks wrong
+## Touch not detected
 
-- Battery saver only matters if `batterySaver=true`.
-- Brightness clamp only matters if `enableMinBrightness=true`.
-- Both features are event-driven, so trigger a display or battery change to
-  re-evaluate state.
+- Non-root skips `/dev/input` registration by design.
+- SELinux or missing `CAP_SYS_ADMIN`-class access to input nodes.
+- Screen off: kernel often suppresses events; state resets on off edge.
+- Phantom contacts are debounced (50 ms); very quick taps may not boost.
 
-## WebUI does not load
+## Wrong foreground package
 
-- Verify the manager actually supports the bundled WebUI scheme.
-- Confirm the module installed successfully and `webroot/index.html` exists.
-- Reinstall if the module zip was modified manually.
+- Inspect the `@dfps` push line (root/shell).
+- Package is taken from focused root-task **childTaskNames** (`pkg/cls`),
+  not from `IProcessObserver` uid/pid (those are triggers only).
+- Some ROMs report process names; rules must match the string dfps sees.
+- Exact case-sensitive match; max 256 rules.
+
+## Battery / brightness wrong
+
+| Feature | Requires | Notes |
+|---|---|---|
+| Low battery / power-save cap | `batterySaver=true` | Power-save polled every 30 s; level via Binder, uevent, or sysfs |
+| Brightness clamp | `enableMinBrightness=true` | Needs display callback event 4 (mask includes bit 8) or legacy poll |
+
+Binder battery parcels differ by OEM; absurd jumps (>30 points) are ignored
+and sysfs/uevent stay authoritative. Dock/keyboard supplies are filtered when
+the main `Battery` supply name is known.
+
+## Config reload ignored
+
+- Save must produce `IN_CLOSE_WRITE` or `IN_MOVED_TO` on the watch dir
+  (`/data/local/tmp/dfps`). Atomic replace (`mv` into place) is fine.
+- Conf missing → defaults; modes missing/empty → keep prior map (look for
+  the keep-warning in logcat).
+- Per-app change applies after reload for the **current** FG package without
+  waiting for the next app switch.
+
+## Module WebUI
+
+- Manager must support the bundled WebUI scheme; `webroot/index.html` present.
+- Reinstall if the zip was hand-edited. Unrelated to the daemon core if
+  `dfps` itself is healthy in logcat.

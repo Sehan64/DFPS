@@ -1,59 +1,67 @@
-# DFPS
+# dfpsd
 
-DFPS is a small Android daemon that switches display refresh rate from touch,
-foreground app, brightness, and battery state. It ships as a root module for
-Magisk, KernelSU, and Axeron, and exposes a simple `@dfps` socket for
-foreground-package snapshots.
+Root-resident Android daemon that switches display refresh rate from touch,
+foreground app, brightness, and battery state. Ships as a Magisk / KernelSU /
+Axeron module and exposes a small `@dfps` control socket.
 
-## What it does
+Fork of [yc9559/dfps](https://github.com/yc9559/dfps), rewritten in C for
+low overhead. Configuration divergences from upstream are documented in
+[`docs/HELP.md`](docs/HELP.md).
 
-- Touch moves the display to the active rate.
-- Idle timeout returns the display to the idle rate.
-- Per-app rules override the default rates.
-- Brightness clamp can force the minimum rate when dim.
-- Battery saver and low-battery mode cap the active rate.
-- `dfps.conf` and `modes.map` reload live from `/data/local/tmp/dfps/`.
+## Behavior
 
-## Runtime model
+| Input | Effect |
+|---|---|
+| Touch down (after 50 ms debounce) | Active rate for the focused app |
+| Touch up + `touchSlackMs` | Drop back to idle rate |
+| Foreground app change | Apply per-app idle/active rules (or defaults) |
+| Low brightness (optional) | Clamp to minimum physical rate |
+| Power-save / low battery (optional) | Cap the active rate |
+| Screen off | Optional `offscreenRate`, or leave the panel alone |
 
-- Binder handles ActivityManager, PowerManager, SurfaceFlinger, DisplayManager,
-  and battery state.
-- One epoll thread handles touch input, inotify reloads, sockets, and uevents.
-- The main process starts the Binder thread pool and exits cleanly on
-  `SIGTERM` / `SIGINT`.
-- `@dfps` is a singleton abstract socket. A second instance fails startup.
+Config and mode map hot-reload from `/data/local/tmp/dfps/` via inotify.
 
-## Build and install
-
-- [BUILDING.md](docs/BUILDING.md)
-- [INSTALLATION.md](docs/INSTALLATION.md)
-
-Quick start:
+## Quick start
 
 ```bash
+# build on-device (Termux) or with NDK clang in PATH
 make
-make install
-su # or adb shell
-/data/local/tmp/dfps/dfps
+make install   # → /data/local/tmp/dfps/bin/dfps
+
+su -c '/data/local/tmp/dfps/dfps --version'
+su -c 'pgrep -af dfps'
+logcat -s DFPS_Daemon
 ```
 
-## Configuration
+Module install: flash `dfps.zip` in Magisk / KernelSU / Axeron, then reboot.
+See [`docs/INSTALLATION.md`](docs/INSTALLATION.md).
 
-- [CONFIGURATION.md](docs/CONFIGURATION.md)
-- [CLIENT_PROTOCOL.md](docs/CLIENT_PROTOCOL.md)
+## Runtime files
 
-Runtime files:
+| Path | Role |
+|---|---|
+| `/data/local/tmp/dfps/dfps` | Daemon binary (module symlink) |
+| `/data/local/tmp/dfps/dfps.conf` | Globals + per-app rules |
+| `/data/local/tmp/dfps/modes.map` | Hz → SurfaceFlinger config ID |
+| abstract `@dfps` | Foreground push + `STATUS` health |
 
-- `/data/local/tmp/dfps/dfps.conf`
-- `/data/local/tmp/dfps/modes.map`
+Prefer a root-owned `0700` directory so unprivileged apps cannot rewrite rates.
 
-## More docs
+## Documentation
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [SECURITY.md](docs/SECURITY.md)
-- [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+| Doc | Contents |
+|---|---|
+| [`docs/HELP.md`](docs/HELP.md) | User-facing option guide |
+| [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | File format reference |
+| [`docs/INSTALLATION.md`](docs/INSTALLATION.md) | Module install / verify / uninstall |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Build, tests, `resolver_bytes.h` |
+| [`docs/OPS.md`](docs/OPS.md) | Runbook: process, STATUS, logs, reload |
+| [`docs/CLIENT_PROTOCOL.md`](docs/CLIENT_PROTOCOL.md) | `@dfps` wire protocol |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Threads, rate logic, hot path |
+| [`docs/INIT.md`](docs/INIT.md) | Boot, hardening, capabilities |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | Threat model and auth |
+| [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Common failures |
 
 ## License
 
-DFPS is licensed under the Apache License, Version 2.0. See
-[LICENSE](LICENSE) for the full text.
+Apache License 2.0 — see [`LICENSE`](LICENSE).

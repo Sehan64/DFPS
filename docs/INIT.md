@@ -1,76 +1,78 @@
-# Initialization
+# Initialization and hardening
 
-This documents how `dfps` comes up, what it does at startup, and how the
-hardening it applies fits with the surrounding init / SELinux context.
+How `dfps` comes up, what it hardens itself, and what must be granted by
+init / SELinux.
 
 ## Boot launch
 
-The shipped module starts the daemon at boot:
+Module `service.sh` (or equivalent root-manager boot hook) execs:
 
-- **service.sh** (default for the tri-module): runs from the root manager's
-  boot trigger and execs `/data/local/tmp/dfps/dfps`.
+```text
+/data/local/tmp/dfps/dfps
+```
 
-The daemon itself:
+The process:
 
-- fails fast if the singleton `@dfps` abstract socket is already bound
-  (prevents a second copy),
-- resolves `libbinder_ndk.so` and the system Binder services
-  (`activity`, `power`, `SurfaceFlinger`, `display`, `batteryproperties`),
-- registers a process observer and (when supported) an IDisplayManager
-  callback, then enters the event loop.
+1. Fails if abstract `@dfps` is already bound (singleton).
+2. Resolves `libbinder_ndk.so` and system services (`activity`, `power`,
+   `SurfaceFlinger`, `display`, `batteryproperties`).
+3. Resolves Binder transaction codes (cache or `app_process` helper JAR).
+4. Loads config, opens touch devices (root), inotify, uevent, timerfd.
+5. Registers process observer and (when possible) display callback.
+6. Enters the epoll loop on a dedicated thread; `main` joins it.
 
-## What the daemon hardens itself
+## Self-hardening (in order)
 
-At startup the daemon applies, in order:
+| Step | Intent |
+|---|---|
+| `mlockall(MCL_CURRENT \| MCL_FUTURE)` | Keep working set resident (best-effort) |
+| `prctl(PR_SET_TIMERSLACK, 0)` | Reduce wakeup jitter |
+| `prctl(PR_SET_IO_FLUSHER, 1)` | Prefer prompt dirty flush |
+| `prctl(PR_SET_NO_NEW_PRIVS, 1)` | Block setuid re-escalation after start |
+| `prctl(PR_SET_DUMPABLE, 0)` | No core dumps; no unprivileged ptrace |
+| `prctl(PR_SET_KEEP_CAPS, 1)` | Retain caps across any later drop |
+| `sched_setscheduler(SCHED_FIFO, 2)` | RT scheduling; else `setpriority(-20)` |
+| CPU affinity | Efficiency cluster (lowest max freq) when heterogeneous |
 
-1. `mlockall(MCL_CURRENT | MCL_FUTURE)` — keep the working set resident
-   (best-effort; logged and ignored if denied).
-2. `prctl(PR_SET_TIMERSLACK, 0)` — minimize wakeup jitter.
-3. `prctl(PR_SET_IO_FLUSHER, 1)` — ask the kernel to flush dirty data
-   promptly.
-4. `prctl(PR_SET_NO_NEW_PRIVS, 1)` — block gaining privileges via a setuid
-   helper after startup.
-5. `prctl(PR_SET_DUMPABLE, 0)` — no core dumps, no `ptrace` attach by
-   unprivileged processes.
-6. `prctl(PR_SET_KEEP_CAPS, 1)` — keep the needed capabilities across any
-   future drop (see below).
-7. `sched_setscheduler(..., SCHED_FIFO, 2)` — real-time scheduling; falls back
-   to `setpriority(..., -20)` if denied.
+Fatal signals (SEGV/ABRT/BUS/ILL/FPE) log a best-effort backtrace to stderr
+then re-raise so the supervisor sees the real signal. `SIGPIPE` and
+`SIGWINCH` are blocked.
 
-## Capability reduction is left to init / SELinux
+## Capabilities (left to init / SELinux)
 
-The in-process hardening deliberately stops at `PR_SET_KEEP_CAPS` rather than
-calling `capset` to drop to a minimal set. The exact capabilities the daemon
-needs depend on the device:
+The binary does **not** `capset` down to a minimal set — required caps vary
+by device:
 
-- `CAP_NET_ADMIN` — open the kernel uevent (`NETLINK_KOBJECT_UEVENT`)
-  netlink socket used for display hotplug detection.
-- `CAP_SYS_ADMIN` — `/dev/input` access and sysfs/refresh-rate control on some
-  kernels.
+| Cap | Typical need |
+|---|---|
+| `CAP_NET_ADMIN` | `NETLINK_KOBJECT_UEVENT` for power_supply events |
+| `CAP_SYS_ADMIN` | `/dev/input` and some sysfs/refresh paths on certain kernels |
 
-Granting these is the job of the launching context, not the binary:
+Grant via the service definition (`capabilities NET_ADMIN SYS_ADMIN`) and/or
+an SELinux domain that allows Binder, uevent netlink, and input open/read.
+With `NO_NEW_PRIVS` + `KEEP_CAPS`, a compromise cannot regain dropped caps
+through a setuid helper.
 
-- under **init** (a direct `init` service or the module's `service.sh`): grant
-  them via the service definition's `capabilities` line (`NET_ADMIN SYS_ADMIN`).
-- under **SELinux**: run in a domain (the `su` domain is the permissive
-  fallback) that allows Binder transacts, the uevent netlink socket, and
-  `/dev/input` open/read.
+## Runtime directory
 
-Because the daemon sets `PR_SET_NO_NEW_PRIVS` and `PR_SET_KEEP_CAPS`, it
-cannot regain dropped caps and a compromise cannot re-escalate through a
-setuid binary.
+`/data/local/tmp/dfps` holds conf, modes map, tx cache, and the resolver JAR.
+Created as `0700` when missing; if group/other-writable, the daemon warns
+and best-effort `chmod 0700` when euid is 0. Prefer root:root `0700` at
+install time.
 
 ## Socket authentication
 
-Every `@dfps` connection is authenticated with `SO_PEERCRED` on accept. Only
-peers running as root (UID 0), the daemon's own UID, or the Android shell
-(`AID_SHELL = 2000`, i.e. `adb shell`) are accepted; any other UID is
-disconnected before any data is exchanged. See `docs/CLIENT_PROTOCOL.md`.
+Every `@dfps` accept uses `SO_PEERCRED`: only UID 0, the daemon UID, or
+AID_SHELL (2000). See [`CLIENT_PROTOCOL.md`](./CLIENT_PROTOCOL.md).
 
 ## Graceful shutdown
 
-On `SIGTERM` / `SIGINT`, or when a critical Binder service dies
-(`onBinderDied`), the daemon sets the shutdown flag and wakes the event loop.
-The loop unwinds (closes epoll / fds / sockets) and `main()` returns, so the
-supervising init respawns a fresh instance. It does **not** call `exit(0)`
-abruptly, which would skip cleanup.
+| Trigger | Mechanism |
+|---|---|
+| `SIGTERM` / `SIGINT` | Signal flag + eventfd; loop sets `g_shutdown_requested` |
+| Critical Binder death | `onBinderDied` sets `g_shutdown_requested` **directly** + eventfd |
+| Second signal | `_exit(128+sig)` |
+
+The loop closes epoll, inotify, server socket, wakeup eventfd, uevent,
+maintenance timerfd, and touch fds before returning so `main` exits cleanly
+for supervisor respawn. It does not call `exit(0)` from the death path.
