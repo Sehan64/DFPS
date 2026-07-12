@@ -38,25 +38,34 @@ const unsigned char resolver_jar[] = {
 
 binder_status_t displayCallbackOnTransact(AIBinder* binder, transaction_code_t code,
                                            const AParcel* in, AParcel* out) {
+    /* Runs on a Binder thread-pool thread. It must NOT issue blocking binder
+     * transactions (re-entrant binder back into Power/DisplayManager from an
+     * incoming dispatch thread is fragile and can stall the zero-extra-thread
+     * pool). Instead it only records which state changed and wakes the epoll
+     * thread, which performs the actual isInteractive / getBrightness queries
+     * from a safe context. Same pattern observerOnTransact already uses. */
     (void)binder; (void)out;
     if (code == g_hot_ops.resolvedOnDisplayEventCode) {
         int32_t displayId = -1;
         int32_t event = -1;
         if (g_hot_ops.readInt32(in, &displayId) == STATUS_OK && displayId == 0) {
             if (g_hot_ops.readInt32(in, &event) == STATUS_OK) {
-                /* event 2 -> EVENT_DISPLAY_CHANGED */
-                /* event 4 -> EVENT_DISPLAY_BRIGHTNESS_CHANGED */
+                /* event 2 -> EVENT_DISPLAY_CHANGED (interactive/state)
+                 * event 4 -> EVENT_DISPLAY_BRIGHTNESS_CHANGED (brightness) */
                 if (event == 2) {
-                    checkInteractiveAndPowerSave(true);
+                    atomic_store_explicit(&g_interactive_dirty, true,
+                                          memory_order_release);
                 } else if (event == 4) {
-                    checkMinBrightness();
+                    atomic_store_explicit(&g_brightness_dirty, true,
+                                          memory_order_release);
                 } else {
-                    checkInteractiveAndPowerSave(true);
-                    checkMinBrightness();
+                    /* Unknown event type: re-probe both to be safe. */
+                    atomic_store_explicit(&g_interactive_dirty, true,
+                                          memory_order_release);
+                    atomic_store_explicit(&g_brightness_dirty, true,
+                                          memory_order_release);
                 }
-            } else {
-                checkInteractiveAndPowerSave(true);
-                checkMinBrightness();
+                triggerPollerWakeup();
             }
         }
     }
@@ -129,6 +138,18 @@ static inline void readTaskNames(readString_t readString, const AParcel* reply,
     }
 }
 
+/* Read and discard n int32 parcel fields (used to skip over reply fields
+ * whose values we don't need). Returns true on read error. */
+__attribute__((hot, always_inline))
+static inline bool skipInt32(const AParcel* reply, int n) {
+    int32_t scratch;
+    for (int i = 0; i < n; ++i) {
+        if (__builtin_expect(g_hot_ops.readInt32(reply, &scratch) != STATUS_OK, 0))
+            return true;
+    }
+    return false;
+}
+
 __attribute__((hot, always_inline))
 static inline void parseRootTaskInfoReply(const AParcel* reply) {
     const readInt32_t  readInt32  = g_hot_ops.readInt32;
@@ -137,19 +158,12 @@ static inline void parseRootTaskInfoReply(const AParcel* reply) {
 
     if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
     if (scratch) {
-        if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-        if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-        if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-        if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
+        if (skipInt32(reply, 4)) return;
     }
 
     int32_t child_task_count = 0;
     if (__builtin_expect(readInt32(reply, &child_task_count) != STATUS_OK, 0)) return;
-    if (child_task_count > 0) {
-        for (int32_t i = 0; i < child_task_count; ++i) {
-            if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-        }
-    }
+    if (child_task_count > 0 && skipInt32(reply, child_task_count)) return;
 
     int32_t child_task_count_2 = 0;
     if (__builtin_expect(readInt32(reply, &child_task_count_2) != STATUS_OK, 0)) return;
@@ -160,21 +174,12 @@ __attribute__((hot, always_inline))
 static inline void parseStackInfoReply(const AParcel* reply) {
     const readInt32_t  readInt32  = g_hot_ops.readInt32;
     const readString_t readString = g_hot_ops.readString;
-    int32_t scratch = 0;
 
-    if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-    if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-    if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-    if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-    if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
+    if (skipInt32(reply, 5)) return;
 
     int32_t task_count = 0;
     if (__builtin_expect(readInt32(reply, &task_count) != STATUS_OK, 0)) return;
-    if (task_count > 0) {
-        for (int32_t i = 0; i < task_count; ++i) {
-            if (__builtin_expect(readInt32(reply, &scratch) != STATUS_OK, 0)) return;
-        }
-    }
+    if (task_count > 0 && skipInt32(reply, task_count)) return;
 
     int32_t name_count = 0;
     if (__builtin_expect(readInt32(reply, &name_count) != STATUS_OK, 0)) return;

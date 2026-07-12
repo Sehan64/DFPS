@@ -24,6 +24,9 @@
 
 #include "dfps.h"
 
+/* SurfaceFlinger backdoor transaction codes are defined in dfps.h
+ * (SF_TX_SET_ACTIVE_CONFIG / SF_TX_FRAME_RATE_FLEX). */
+
 /* ================================================================== */
 /*  Internal helpers (file-local)                                      */
 /* ================================================================== */
@@ -56,11 +59,14 @@ static int32_t resolveRootId(int32_t rate) {
         }
     }
 
-    /* Closest match — cap at 30 Hz difference to avoid wildly wrong selections */
+    /* Closest match — cap at 30 Hz difference to avoid wildly wrong selections.
+     * Use <= so a difference exactly at the cap (e.g. requesting 90 Hz on a
+     * {60,120} device, both 30 off) still resolves instead of failing. */
     int32_t closest_id = -1, closest_rate = 0, min_diff = 30;
     for (int i = 0; i < g_mode_count; i++) {
-        int32_t diff = abs(g_modes[i].rate - rate);
-        if (diff < min_diff) {
+        int32_t diff = g_modes[i].rate - rate;
+        diff = diff < 0 ? -diff : diff;  /* safe abs: avoids int overflow UB */
+        if (diff <= min_diff) {
             min_diff = diff;
             closest_rate = g_modes[i].rate;
             closest_id = g_modes[i].id;
@@ -90,13 +96,14 @@ static bool setSfActiveConfigDirect(int32_t id) {
         g_hot_ops.writeInt32(in, id);
         AParcel* reply = NULL;
         binder_status_t status = g_hot_ops.transact(
-            g_hot_binders.surfaceFlinger, 1035, &in, &reply, 0);
+            g_hot_binders.surfaceFlinger, SF_TX_SET_ACTIVE_CONFIG, &in, &reply, 0);
         if (status == STATUS_OK) {
             if (reply) g_hot_ops.deleteParcel(reply);
             return true;
         }
         if (reply) g_hot_ops.deleteParcel(reply);
-        LOGE("Direct SurfaceFlinger binder transaction 1035 failed: status %d", status);
+        LOGE("Direct SurfaceFlinger binder transaction %u failed: status %d",
+             SF_TX_SET_ACTIVE_CONFIG, status);
         return false;
     }
     return false;
@@ -114,22 +121,23 @@ void setSurfaceFlingerFrameRateFlex(bool enable) {
 
     AParcel* in = NULL;
     if (g_hot_ops.prepareTransaction(g_hot_binders.surfaceFlinger, &in) != STATUS_OK || !in) {
-        LOGE("Failed preparing SurfaceFlinger transaction 1036.");
+        LOGE("Failed preparing SurfaceFlinger transaction %u.", SF_TX_FRAME_RATE_FLEX);
         return;
     }
 
     g_hot_ops.writeInt32(in, enable ? 1 : 0);
     AParcel* reply = NULL;
     binder_status_t status = g_hot_ops.transact(
-        g_hot_binders.surfaceFlinger, 1036, &in, &reply, 0);
+        g_hot_binders.surfaceFlinger, SF_TX_FRAME_RATE_FLEX, &in, &reply, 0);
     if (reply) g_hot_ops.deleteParcel(reply);
 
     if (status == STATUS_OK) {
-        LOGI("SurfaceFlinger frame-rate flexibility %s via transaction 1036.",
-             enable ? "enabled" : "disabled");
+        LOGI("SurfaceFlinger frame-rate flexibility %s via transaction %u.",
+             enable ? "enabled" : "disabled", SF_TX_FRAME_RATE_FLEX);
     } else {
-        LOGW("SurfaceFlinger transaction 1036 failed: status %d. "
-             "Continuing with direct mode changes only.", status);
+        LOGW("SurfaceFlinger transaction %u failed: status %d. "
+             "Continuing with direct mode changes only.",
+             SF_TX_FRAME_RATE_FLEX, status);
     }
 }
 

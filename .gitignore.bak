@@ -7,7 +7,6 @@ dfps.zip.bak
 *.o
 *.so
 *.a
-.module
 
 # Local configuration and secrets
 gh_token.txt

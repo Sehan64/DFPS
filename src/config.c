@@ -33,6 +33,13 @@
 #define DFPS_MODES_MAP_PATH "/data/local/tmp/dfps/modes.map"
 #endif
 
+/* Skip leading ASCII whitespace and return the first non-space character. */
+__attribute__((cold, always_inline))
+static inline char* skip_leading_ws(char* p) {
+    while (isspace((unsigned char)*p)) p++;
+    return p;
+}
+
 /* ================================================================== */
 /*  SurfaceFlinger mode map                                            */
 /* ================================================================== */
@@ -57,8 +64,7 @@ void loadModesMap(void) {
             char* hash = strchr(line, '#');
             if (hash) *hash = '\0';
 
-            char* p = line;
-            while (isspace((unsigned char)*p)) p++;
+            char* p = skip_leading_ws(line);
             if (*p == '\0') continue;
 
             char* end = NULL;
@@ -147,6 +153,20 @@ void rebuildRuleHash(void) {
 }
 
 __attribute__((cold))
+/* Parse a base-10 int32 from a fully-trimmed string. Returns false unless the
+ * ENTIRE string is a valid integer (no trailing garbage, no overflow). On
+ * failure *out is left unchanged so the caller keeps its default value —
+ * this prevents garbage like "abc" from silently becoming 0. */
+static bool parse_int32(const char* s, int32_t* out) {
+    if (s == NULL || *s == '\0') return false;
+    char* endptr = NULL;
+    errno = 0;
+    long v = strtol(s, &endptr, 10);
+    if (endptr == s || *endptr != '\0' || errno == ERANGE) return false;
+    *out = (int32_t)v;
+    return true;
+}
+
 void loadConfig(void) {
     const char* config_path = DFPS_CONFIG_PATH;
     FILE* f = fopen(config_path, "r");
@@ -191,17 +211,26 @@ void loadConfig(void) {
             char* key = line;
             char* val = eq + 1;
 
-            while (isspace((unsigned char)*key)) key++;
+            key = skip_leading_ws(key);
             if (*key == '\0') continue;
             char* key_end = key + strlen(key) - 1;
             while (key_end > key && isspace((unsigned char)*key_end)) *key_end-- = '\0';
             while (isspace((unsigned char)*val)) val++;
+            /* Trim trailing whitespace so a value like "key = 45  " (with a
+             * trailing space, as written by some editors) is accepted by the
+             * strict parser below instead of being flagged as garbage. */
+            {
+                size_t vlen = strlen(val);
+                while (vlen > 0 && isspace((unsigned char)val[vlen - 1]))
+                    val[--vlen] = '\0';
+            }
 
             if (strcasecmp(key, "DEBUG") == 0) {
                 if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
                     temp_debug = true;
             } else if (strcasecmp(key, "touchSlackMs") == 0) {
-                char *ep; temp_slack = (int32_t)strtol(val, &ep, 10);
+                int32_t v; if (parse_int32(val, &v)) temp_slack = v;
+                else LOGE("dfps.conf: invalid touchSlackMs '%s', using default %d", val, temp_slack);
             } else if (strcasecmp(key, "enableFrameRateFlex") == 0) {
                 if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
                     temp_frame_rate_flex = true;
@@ -209,20 +238,26 @@ void loadConfig(void) {
                 if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
                     temp_min_bright = true;
             } else if (strcasecmp(key, "minBrightnessThreshold") == 0) {
-                char *ep; temp_min_bright_threshold = (int32_t)strtol(val, &ep, 10);
+                int32_t v; if (parse_int32(val, &v)) temp_min_bright_threshold = v;
+                else LOGE("dfps.conf: invalid minBrightnessThreshold '%s', using default %d", val, temp_min_bright_threshold);
             } else if (strcasecmp(key, "defaultIdle") == 0) {
-                char *ep; temp_default_idle = (int32_t)strtol(val, &ep, 10);
+                int32_t v; if (parse_int32(val, &v)) temp_default_idle = v;
+                else LOGE("dfps.conf: invalid defaultIdle '%s', using default %d", val, temp_default_idle);
             } else if (strcasecmp(key, "defaultActive") == 0) {
-                char *ep; temp_default_active = (int32_t)strtol(val, &ep, 10);
+                int32_t v; if (parse_int32(val, &v)) temp_default_active = v;
+                else LOGE("dfps.conf: invalid defaultActive '%s', using default %d", val, temp_default_active);
             } else if (strcasecmp(key, "offscreenRate") == 0) {
-                char *ep; temp_offscreen_rate = (int32_t)strtol(val, &ep, 10);
+                int32_t v; if (parse_int32(val, &v)) temp_offscreen_rate = v;
+                else LOGE("dfps.conf: invalid offscreenRate '%s', using default %d", val, temp_offscreen_rate);
             } else if (strcasecmp(key, "batterySaver") == 0) {
                 if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0)
                     temp_battery_saver = true;
             } else if (strcasecmp(key, "lowBatteryThreshold") == 0) {
-                char *ep; temp_low_battery_threshold = (int32_t)strtol(val, &ep, 10);
+                int32_t v; if (parse_int32(val, &v)) temp_low_battery_threshold = v;
+                else LOGE("dfps.conf: invalid lowBatteryThreshold '%s', using default %d", val, temp_low_battery_threshold);
             } else if (strcasecmp(key, "powerSaveMaxRate") == 0) {
-                char *ep; temp_power_save_max_rate = (int32_t)strtol(val, &ep, 10);
+                int32_t v; if (parse_int32(val, &v)) temp_power_save_max_rate = v;
+                else LOGE("dfps.conf: invalid powerSaveMaxRate '%s', using default %d", val, temp_power_save_max_rate);
             } else {
                 /* Per-app rule: "PackageName = idle active" */
                 int idle = -1, active = -1;

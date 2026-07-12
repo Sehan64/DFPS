@@ -63,6 +63,7 @@ _Atomic int32_t   g_last_set_rate = -1;
 _Atomic uint64_t  g_last_touch_time = 0;
 _Atomic bool      g_screen_interactive = true;
 _Atomic bool      g_touching = false;
+uint64_t          g_touch_down_since = 0;
 bool              g_root_mode = false;
 _Atomic bool      g_shutdown_requested = false;
 static volatile sig_atomic_t s_shutdown_signal_seen = 0;
@@ -78,6 +79,8 @@ _Atomic int32_t   g_battery_level = 100;
 
 _Atomic bool      g_min_brightness_clamp = false;
 _Atomic bool      g_display_callback_active = false;
+_Atomic bool      g_interactive_dirty = false;
+_Atomic bool      g_brightness_dirty = false;
 
 uint64_t         g_start_time = 0;
 
@@ -90,6 +93,7 @@ pthread_spinlock_t g_client_lock;
 
 /* File descriptors */
 int  g_wakeup_fd = -1;
+int  g_maintenance_timer_fd = -1;
 int  g_inotify_fd = -1;
 int  g_inotify_wd = -1;
 char g_watch_dir[PATH_MAX] = {0};
@@ -270,6 +274,13 @@ static const char* kDfpVersion = DFP_VERSION;
 #endif
 static const char* kDfpBuild = DFP_BUILD_STAMP;
 
+/* Thin wrapper that sets a single prctl flag, ignoring the trailing
+ * (always-zero) prctl arguments, so the hardening block below stays readable. */
+__attribute__((cold, always_inline))
+static inline void setPrctlFlag(unsigned long op, unsigned long arg) {
+    prctl(op, arg, 0, 0, 0);
+}
+
 int main(int argc, char** argv) {
     /* Version / help must work even when run unprivileged or before
      * any heavy setup, so handle it first. */
@@ -296,11 +307,11 @@ int main(int argc, char** argv) {
         LOGW("mlockall(MCL_CURRENT | MCL_FUTURE) failed: %s — pages may be paged out under pressure.",
              strerror(errno));
     }
-    prctl(PR_SET_TIMERSLACK, 0);
+    setPrctlFlag(PR_SET_TIMERSLACK, 0);
     #ifndef PR_SET_IO_FLUSHER
     #define PR_SET_IO_FLUSHER 33
     #endif
-    prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+    setPrctlFlag(PR_SET_IO_FLUSHER, 1);
 
     /* Hardening: the daemon runs as root (needed for /dev/input and the
      * netlink uevent socket). Prevent it from gaining further
@@ -318,9 +329,9 @@ int main(int argc, char** argv) {
     #ifndef PR_SET_KEEP_CAPS
     #define PR_SET_KEEP_CAPS 7
     #endif
-    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-    prctl(PR_SET_KEEP_CAPS, 1, 0, 0, 0);
+    setPrctlFlag(PR_SET_NO_NEW_PRIVS, 1);
+    setPrctlFlag(PR_SET_DUMPABLE, 0);
+    setPrctlFlag(PR_SET_KEEP_CAPS, 1);
 
     struct sched_param sp = { .sched_priority = 2 };
     if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
@@ -572,7 +583,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     pthread_attr_destroy(&attr);
-    pthread_detach(touch_thread);
 
     /* Register display change callback */
     if (g_hot_binders.displayManager) {
@@ -597,7 +607,14 @@ int main(int argc, char** argv) {
                         if (g_hot_ops.resolvedRegisterCallbackWithEventMaskCode != 0) {
                             g_cold.writeString(in, displayCallback);
 
-                            int64_t event_mask = 2 | 4;
+                            /* DisplayManagerService.CallbackRecord.shouldSendEvent
+                             * maps event num → bit: 1→bit0(1), 2→bit2(4),
+                             * 3→bit1(2), 4→bit3(8), 5→bit4(16). We want
+                             * EVENT_DISPLAY_CHANGED(2) + EVENT_DISPLAY_BRIGHTNESS_CHANGED(4), so
+                             * mask = bit2(4) | bit3(8) = 12. (Previously 2|4=6
+                             * selected event 2_CHANGED + event 3_REMOVED, leaving
+                             * brightness callbacks masked off — see F7.) */
+                            int64_t event_mask = 4 | 8;
                             g_hot_ops.writeInt64(in, event_mask);
                         } else if (g_hot_ops.resolvedRegisterCallbackCode != 0) {
                             g_cold.writeString(in, displayCallback);
@@ -651,8 +668,11 @@ int main(int argc, char** argv) {
     if (reply) g_hot_ops.deleteParcel(reply);
 
     queryFocusedTask();
-    while (!atomic_load_explicit(&g_shutdown_requested, memory_order_acquire)) {
-        usleep(250000);
-    }
+
+    /* Block until the event-loop thread exits. That thread owns the shutdown
+     * lifecycle: SIGTERM/SIGINT (or a socket "exit") sets the shutdown flag,
+     * its loop breaks, and it returns. Joining replaces the former 250 ms
+     * spin-sleep keepalive, so the main thread no longer wakes on a timer. */
+    pthread_join(touch_thread, NULL);
     return 0;
 }

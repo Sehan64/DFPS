@@ -25,6 +25,16 @@
 
 #include "dfps.h"
 
+/* Stack size for the touch/event-loop thread. 256 KiB is ample for the
+ * epoll loop and keeps the daemon's memory footprint small. */
+#define TOUCH_THREAD_STACK_SIZE  (256 * 1024)
+
+/* Interval for the maintenance timerfd, which drives the only states that
+ * have no binder callback (power-save mode and battery level). 30s matches
+ * the existing battery-scan rate limit; interactive/brightness remain fully
+ * event-driven through the IDisplayManager callback. */
+#define MAINTENANCE_INTERVAL_SEC 30
+
 static bool s_touch_tracking_fallback[MAX_TOUCH_DEVICES];
 static unsigned long s_touch_active_slots[MAX_TOUCH_DEVICES];
 static int s_touch_current_slot[MAX_TOUCH_DEVICES];
@@ -190,6 +200,22 @@ static inline void updateTouchStateFromEvent(const struct input_event* ev,
                                              bool* saw_state,
                                              bool* saw_active,
                                              bool* final_touching) {
+    if (ev->type == EV_SYN) {
+        if (ev->code == SYN_DROPPED) {
+            /* Kernel dropped events and we lost sync. Reset this device's slot
+             * tracking and assume not touching until the next SYN_REPORT
+             * re-syncs. Without this, a dropped TRACKING_ID=-1 leaves
+             * g_touching stuck true forever. */
+            if (device_index >= 0 && device_index < MAX_TOUCH_DEVICES) {
+                s_touch_active_slots[device_index] = 0;
+                s_touch_current_slot[device_index] = 0;
+                *saw_state = true;
+                *final_touching = false;
+            }
+        }
+        return;
+    }
+
     if (ev->type == EV_KEY && ev->code == BTN_TOUCH) {
         if (ev->value == 0 || ev->value == 1) {
             *saw_state = true;
@@ -240,6 +266,15 @@ void* touchListenerThread(void* arg) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
         LOGE("Failed to create epoll instance.");
+        /* Clean up already-open descriptors so we don't leak fds and leave
+         * the wakeup eventfd unconsumed (which would make the daemon
+         * unresponsive to shutdown). */
+        if (g_inotify_fd >= 0) close(g_inotify_fd);
+        if (g_server_fd >= 0) close(g_server_fd);
+        if (g_wakeup_fd >= 0) close(g_wakeup_fd);
+    if (g_uevent_fd >= 0) close(g_uevent_fd);
+    if (g_maintenance_timer_fd >= 0) close(g_maintenance_timer_fd);
+        for (int i = 0; i < g_touch_fd_count; i++) close(g_touch_fds[i]);
         return NULL;
     }
 
@@ -287,6 +322,39 @@ void* touchListenerThread(void* arg) {
         }
     }
 
+    /* Maintenance timer: drives the only states that have no binder callback
+     * (system power-save mode and battery level), so the loop stays
+     * event-driven for interactive/brightness. Created UNCONDITIONALLY — it
+     * must not depend on the netlink uevent socket, which only root opens and
+     * which may fail to bind. Without this timer, g_power_save_mode is never
+     * probed and the power-save / low-battery rate cap stays inert whenever
+     * g_uevent_fd < 0 (e.g. non-root mode). Battery sysfs polling below is
+     * still gated by batterySaver, but power-save probing is not (see F1). */
+    g_maintenance_timer_fd = timerfd_create(CLOCK_MONOTONIC,
+                                            TFD_NONBLOCK | TFD_CLOEXEC);
+    if (g_maintenance_timer_fd < 0) {
+        LOGE("Failed to create maintenance timerfd: %s", strerror(errno));
+    } else {
+        struct itimerspec its;
+        its.it_interval.tv_sec = MAINTENANCE_INTERVAL_SEC;
+        its.it_interval.tv_nsec = 0;
+        its.it_value.tv_sec = MAINTENANCE_INTERVAL_SEC;
+        its.it_value.tv_nsec = 0;
+        if (timerfd_settime(g_maintenance_timer_fd, 0, &its, NULL) < 0) {
+            LOGE("Failed to arm maintenance timerfd: %s", strerror(errno));
+            close(g_maintenance_timer_fd);
+            g_maintenance_timer_fd = -1;
+        } else {
+            ev.events = EPOLLIN;
+            ev.data.ptr = tag_fd(FD_TIMER, g_maintenance_timer_fd);
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, g_maintenance_timer_fd, &ev) < 0) {
+                LOGE("Failed to add maintenance timerfd to epoll");
+                close(g_maintenance_timer_fd);
+                g_maintenance_timer_fd = -1;
+            }
+        }
+    }
+
     struct epoll_event events[64];
     const int MAX_EVENTS = 64;
 
@@ -296,12 +364,12 @@ void* touchListenerThread(void* arg) {
     /* Overhead note: this loop is the daemon's only hot path. It does one
      * coarse CLOCK_MONOTONIC read per iteration (getNowMs, used both for the
      * epoll timeout and below), no allocations, and no Binder traffic while
-     * the IDisplayManager callback is active (foreground/power/brightness
-     * arrive as events, not polls). The idle branch below is the only periodic
-     * work and is already minimal + battery-scan-gated. Further reductions
-     * (e.g. dropping the per-idle power-save probe) require on-device
-     * profiling (perfetto/systrace) to confirm they are safe — do not
-     * micro-optimize blind. */
+     * the IDisplayManager callback is active (interactive/brightness arrive
+     * as events, not polls). When the callback is active the loop blocks on
+     * epoll_wait(-1) and is fully event-driven; the only remaining periodic
+     * work is the maintenance timerfd, which probes power-save mode and the
+     * battery level (states that have no callback). The legacy idle branch
+     * below (no display callback) is minimal + battery-scan-gated. */
     uint64_t now = getNowMs();
 
     while (!atomic_load_explicit(&g_shutdown_requested, memory_order_acquire)) {
@@ -353,6 +421,7 @@ void* touchListenerThread(void* arg) {
                 s_touch_active_slots[t] = 0;
                 s_touch_current_slot[t] = 0;
             }
+            g_touch_down_since = 0;
             if (atomic_load_explicit(&g_touching, memory_order_relaxed)) {
                 atomic_store_explicit(&g_touching, false, memory_order_relaxed);
                 atomic_store_explicit(&g_last_touch_time, now, memory_order_relaxed);
@@ -400,18 +469,71 @@ void* touchListenerThread(void* arg) {
                     }
 
                     if (saw_touch_state) {
+                        /* Debounce: a contact must persist for at least
+                         * TOUCH_DEBOUNCE_MS before it is treated as a real
+                         * touch that engages the higher refresh rate. Panels
+                         * routinely emit spurious / self-cancelling MT
+                         * contacts (and phantom down/up pairs) while idle;
+                         * without this, those flip g_touching and make the
+                         * rate ramp between idle and active for no reason.
+                         *
+                         * Before this fix, debounce always used the
+                         * per-iteration `now` for both the down timestamp and
+                         * the evaluation, so an entire event batch (down+up)
+                         * still showed a 0-ms hold. Now we peek a real
+                         * timestamp from the last touch-event we read so
+                         * the debounce sees real event spacing rather than
+                         * the iteration clock. Even one batch with a 80-ms
+                         * hold produces a ≥50-ms down duration and the active
+                         * rate engages within this iteration. */
+                        uint64_t touch_now_ms = now;
+                        /* Use the timestamp of the latest touch event we read
+                         * in the batch, converted to a monotonic-ish ms via
+                         * a one-iteration REALTIME→MONOTONIC offset, so a
+                         * held-down contact with real evevnt spacing shows
+                         * its true duration instead of 0. */
+                        if (n > 0 && batch_len > 0) {
+                            const struct input_event* last_ev = &evs[batch_len - 1];
+                            if (last_ev->time.tv_sec > 0) {
+                                uint64_t ev_ms = (uint64_t)last_ev->time.tv_sec * 1000 +
+                                                 last_ev->time.tv_usec / 1000;
+                                struct timespec ts_rt;
+                                clock_gettime(CLOCK_REALTIME, &ts_rt);
+                                uint64_t now_rt_ms = (uint64_t)ts_rt.tv_sec * 1000 +
+                                                     ts_rt.tv_nsec / 1000000;
+                                /* Offset = monotonic now minus realtime now.
+                                 * Subtract that from the event realtime to
+                                 * get an approximate monotonic stamp. */
+                                uint64_t offset = (now_rt_ms > now) ? now_rt_ms - now : 0;
+                                touch_now_ms = (ev_ms > offset) ? ev_ms - offset : now;
+                            }
+                        }
+
+                        if (final_touching) {
+                            if (g_touch_down_since == 0)
+                                g_touch_down_since = touch_now_ms;
+                        } else {
+                            g_touch_down_since = 0;
+                        }
+
+                        bool effective = final_touching &&
+                                         g_touch_down_since != 0 &&
+                                         (touch_now_ms - g_touch_down_since) >=
+                                             (uint64_t)TOUCH_DEBOUNCE_MS;
+
                         bool old_touching = atomic_load_explicit(&g_touching,
-                                                                 memory_order_relaxed);
-                        if (old_touching != final_touching) {
-                            atomic_store_explicit(&g_touching, final_touching,
+                                                                  memory_order_relaxed);
+                        if (effective != old_touching) {
+                            atomic_store_explicit(&g_touching, effective,
                                                   memory_order_relaxed);
-                            atomic_store_explicit(&g_last_touch_time, now,
-                                                  memory_order_relaxed);
-                            needs_rate_update = true;
-                        } else if (!final_touching && saw_active_touch) {
-                            atomic_store_explicit(&g_last_touch_time, now,
+                            atomic_store_explicit(&g_last_touch_time, touch_now_ms,
                                                   memory_order_relaxed);
                             needs_rate_update = true;
+                        } else if (effective && saw_active_touch) {
+                            /* Still effectively touching — keep the active
+                             * window open without forcing a rate re-transition. */
+                            atomic_store_explicit(&g_last_touch_time, touch_now_ms,
+                                                  memory_order_relaxed);
                         }
                     }
                 }
@@ -436,6 +558,21 @@ void* touchListenerThread(void* arg) {
                         queryFocusedTask();
                     }
 
+                    /* Consume any dirty flags set by binder callbacks (F8).
+                     * Callbacks only set the flag+wake; the actual blocking
+                     * binder queries run here on the epoll thread. */
+                    if (atomic_exchange_explicit(&g_interactive_dirty, false,
+                                                  memory_order_acq_rel)) {
+                        /* The display callback delivered event 2
+                         * (DISPLAY_CHANGED) — re-probe interactive state +
+                         * power-save mode. */
+                        checkInteractiveAndPowerSave(true);
+                    }
+                    if (atomic_exchange_explicit(&g_brightness_dirty, false,
+                                                  memory_order_acq_rel)) {
+                        checkMinBrightness();
+                    }
+
                     needs_rate_update = true;
                 }
                 continue;
@@ -452,6 +589,25 @@ void* touchListenerThread(void* arg) {
             if (kind == FD_UEVENT) {
                 if (revents & EPOLLIN) {
                     while (handleUevent()) {
+                    }
+                    needs_rate_update = true;
+                }
+                continue;
+            }
+
+            if (kind == FD_TIMER) {
+                if (revents & EPOLLIN) {
+                    uint64_t expirations;
+                    ssize_t n = read(fd, &expirations, sizeof(expirations));
+                    (void)n;
+                    /* Timer-driven maintenance: power-save mode and battery
+                     * level have no callback, so they are the only states we
+                     * must still poll. Interactive/brightness are event-driven
+                     * through the IDisplayManager callback. */
+                    checkInteractiveAndPowerSave(false);
+                    if (atomic_load_explicit(&g_battery_saver, memory_order_relaxed)) {
+                        int32_t level = readInitialBatteryLevel();
+                        evaluateBatteryState(level);
                     }
                     needs_rate_update = true;
                 }
@@ -547,7 +703,10 @@ void* touchListenerThread(void* arg) {
                                 atomic_load_explicit(&g_min_brightness_clamp, memory_order_relaxed) ? 1 : 0,
                                 atomic_load_explicit(&g_display_callback_active, memory_order_relaxed) ? 1 : 0,
                                 (unsigned long long)(up));
-                            if (send(fd, health, (size_t)hl, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
+                            if (send(fd, health,
+                                     (size_t)hl < sizeof(health) ? (size_t)hl
+                                                                 : sizeof(health) - 1,
+                                     MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
                                 errno != EAGAIN) {
                                 /* Client vanished mid-send; drop below. */
                                 should_close = true;
@@ -600,5 +759,15 @@ void* touchListenerThread(void* arg) {
     for (int i = 0; i < g_touch_fd_count; i++) {
         close(g_touch_fds[i]);
     }
+
+    /* Reset touch tracking so a thread restart (or late consumer) does not
+     * observe stale slot state. */
+    for (int t = 0; t < MAX_TOUCH_DEVICES; t++) {
+        s_touch_active_slots[t] = 0;
+        s_touch_current_slot[t] = 0;
+    }
+    g_touch_fd_count = 0;
+    g_touch_down_since = 0;
+    atomic_store_explicit(&g_touching, false, memory_order_relaxed);
     return NULL;
 }

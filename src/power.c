@@ -268,9 +268,20 @@ bool handleUevent(void) {
     bool is_power_supply = false;
     int new_level = -1;
 
+    /* The name of the supply this event refers to, from POWER_SUPPLY_NAME=.
+     * power_supply uevents carry this so we can tell a main-battery event
+     * from an unrelated supply (dock/keyboard/USB). When s_battery_supply_name
+     * is known (we found "Battery"-typed supply at startup), only act on
+     * events whose name matches it, so a dock battery doesn't drive the rate
+     * cap. When the cached name is unknown (startup scan failed), fall back to
+     * the old "any power_supply with a capacity" behavior. */
+    const char* supply_name = NULL;
+
     while (p < end) {
         if (strcmp(p, "SUBSYSTEM=power_supply") == 0) {
             is_power_supply = true;
+        } else if (strncmp(p, "POWER_SUPPLY_NAME=", 18) == 0) {
+            supply_name = p + 18;
         } else if (strncmp(p, "POWER_SUPPLY_CAPACITY=", 22) == 0) {
             char* endptr = NULL;
             long val = strtol(p + 22, &endptr, 10);
@@ -282,6 +293,12 @@ bool handleUevent(void) {
     }
 
     if (is_power_supply && new_level >= 0) {
+        if (s_battery_supply_name[0] != '\0') {
+            if (supply_name == NULL ||
+                strcmp(supply_name, s_battery_supply_name) != 0) {
+                return true; /* Different supply — ignore. */
+            }
+        }
         evaluateBatteryState(new_level);
     }
     return true;

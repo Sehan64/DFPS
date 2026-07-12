@@ -52,6 +52,7 @@
 #include <sys/poll.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -136,7 +137,8 @@ typedef enum {
     FD_INOTIFY,
     FD_SERVER,
     FD_CLIENT,
-    FD_UEVENT
+    FD_UEVENT,
+    FD_TIMER
 } FdKind;
 
 /* ------------------------------------------------------------------ */
@@ -231,6 +233,19 @@ typedef struct {
 #define MAX_CLIENTS             8
 #define MAX_TASKS               8
 
+/* Touch contacts shorter than this (monotonic ms) are ignored for rate
+ * purposes. Panels routinely emit spurious / self-cancelling MT contacts
+ * while idle; without this debounce the rate ramps between idle and active.
+ * Tune down if you need very quick taps to engage the active rate. */
+#define TOUCH_DEBOUNCE_MS       50
+
+/* SurfaceFlinger vendor "backdoor" transaction codes (see docs/HELP.md).
+ * These are NOT standard AOSP ISurfaceComposer codes — they are OEM/ROM-specific
+ * and only present on some devices. 1035 = set active config by index;
+ * 1036 = toggle the frame-rate-flex policy. */
+#define SF_TX_SET_ACTIVE_CONFIG  1035
+#define SF_TX_FRAME_RATE_FLEX    1036
+
 #define ANDROID_LOG_INFO    4
 #define ANDROID_LOG_WARN    5
 #define ANDROID_LOG_ERROR   6
@@ -296,6 +311,10 @@ extern _Atomic int32_t g_last_set_rate;
 extern _Atomic uint64_t g_last_touch_time;
 extern _Atomic bool     g_screen_interactive;
 extern _Atomic bool     g_touching;
+/* Monotonic-ms timestamp (CLOCK_MONOTONIC_COARSE) when the current raw touch
+ * contact began. Touch-thread-only; 0 means no contact in progress.
+ * Used to debounce short phantom contacts before they engage the rate. */
+extern uint64_t         g_touch_down_since;
 extern bool             g_root_mode;
 extern _Atomic bool     g_shutdown_requested;
 
@@ -317,6 +336,15 @@ extern _Atomic bool     g_min_brightness_clamp;
  * periodic idle-timeout re-queries are skipped to save binder traffic. */
 extern _Atomic bool     g_display_callback_active;
 
+/* Dirty bits set by Binder callbacks (which run on a thread-pool thread) to
+ * tell the epoll thread what to re-query on its next wakeup. Callbacks must
+ * NOT issue blocking binder transactions themselves (re-entrant binder into
+ * Power/DisplayManager from an incoming binder dispatch thread is fragile and
+ * can stall a zero-extra-thread pool — see F8). They set the bit and wake the
+ * loop; the loop does the actual transact from the epoll thread. */
+extern _Atomic bool     g_interactive_dirty;
+extern _Atomic bool     g_brightness_dirty;
+
 /* Touch device fds */
 extern int  g_touch_fds[MAX_TOUCH_DEVICES];
 extern int  g_touch_fd_count;
@@ -335,6 +363,7 @@ extern int  g_client_fds[MAX_CLIENTS];
 extern int  g_client_count;
 
 extern int  g_uevent_fd;
+extern int  g_maintenance_timer_fd;
 
 /* Cross-thread signaling */
 extern atomic_flag g_wakeup_pending;
@@ -432,6 +461,14 @@ void updateRateState(void);
 void updateCurrentAppRates(const char* pkg);
 
 static inline int getPollTimeout(uint64_t now) {
+    /* When the IDisplayManager callback is registered, interactive and
+     * brightness changes arrive as events (via triggerPollerWakeup), so the
+     * loop can block until an event rather than polling. The only states
+     * with no callback — power-save mode and battery level — are driven
+     * by the maintenance timerfd. Block. */
+    if (atomic_load_explicit(&g_display_callback_active, memory_order_relaxed))
+        return -1;
+
     bool interactive = atomic_load_explicit(&g_screen_interactive, memory_order_acquire);
     if (!interactive) return -1;
 
