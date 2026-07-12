@@ -110,7 +110,7 @@ static bool setSfActiveConfigDirect(int32_t id) {
 
     bool prepared = false;
     binder_status_t status = sf_transact_int(SF_TX_SET_ACTIVE_CONFIG, id, &prepared);
-    if (status == STATUS_OK) return true;
+    if (status == STATUS_OK && prepared) return true;
 
     /* Rate-limit: associateClass may be missing on some ROMs; spamming
      * LOGE every epoll tick makes thrashing look worse than it is. */
@@ -147,7 +147,7 @@ void setSurfaceFlingerFrameRateFlex(bool enable) {
     binder_status_t status = sf_transact_int(SF_TX_FRAME_RATE_FLEX, enable ? 1 : 0,
                                             &prepared);
 
-    if (status == STATUS_OK) {
+    if (status == STATUS_OK && prepared) {
         LOGI("SurfaceFlinger frame-rate flexibility %s via transaction %u.",
              enable ? "enabled" : "disabled", SF_TX_FRAME_RATE_FLEX);
     } else if (!prepared) {
