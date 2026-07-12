@@ -89,6 +89,16 @@ binder_status_t batteryListenerOnTransact(AIBinder* binder, transaction_code_t c
                                            const AParcel* in, AParcel* out) {
     (void)binder; (void)out;
     if (code == g_hot_ops.resolvedBatteryChangedCode) {
+        /* Classic BatteryProperties parcel (AOSP):
+         *   bool present; int chargerAcOnline; int chargerUsbOnline;
+         *   int chargerWirelessOnline; int maxChargingCurrent;
+         *   int maxChargingVoltage; int batteryStatus; int batteryHealth;
+         *   ... then batteryLevel among later ints.
+         * OEM builds diverge. We only accept a level that is in 0..100 AND
+         * does not jump more than 30 points from the last known reading
+         * (unless this is the first binder sample). Absurd jumps mean the
+         * skip count is wrong for this ROM — ignore and let sysfs/uevent
+         * remain authoritative. */
         int32_t present = 0;
         if (g_hot_ops.readInt32(in, &present) != STATUS_OK) return STATUS_OK;
         if (present == 1) {
@@ -97,8 +107,26 @@ binder_status_t batteryListenerOnTransact(AIBinder* binder, transaction_code_t c
                 if (g_hot_ops.readInt32(in, &scratch) != STATUS_OK) return STATUS_OK;
             }
             int32_t level = -1;
-            if (g_hot_ops.readInt32(in, &level) == STATUS_OK && level >= 0 && level <= 100) {
-                evaluateBatteryState(level);
+            if (g_hot_ops.readInt32(in, &level) == STATUS_OK &&
+                level >= 0 && level <= 100) {
+                /* Accept the first binder sample unconditionally; afterward
+                 * reject jumps > 30 points as evidence the parcel skip count
+                 * is wrong for this ROM (sysfs/uevent remain authoritative). */
+                static bool s_binder_batt_seen = false;
+                int32_t prev = atomic_load_explicit(&g_battery_level,
+                                                    memory_order_relaxed);
+                int32_t delta = level - prev;
+                if (delta < 0) delta = -delta;
+                if (!s_binder_batt_seen || delta <= 30) {
+                    s_binder_batt_seen = true;
+                    /* Binder pool thread: must wake epoll when state changes. */
+                    if (evaluateBatteryState(level))
+                        triggerPollerWakeup();
+                } else {
+                    LOGW("Ignoring binder battery level %d%% (prev %d%%); "
+                         "parcel layout may not match this ROM. Preferring sysfs/uevent.",
+                         level, prev);
+                }
             }
         }
     }
@@ -326,11 +354,13 @@ void queryFocusedTask(void) {
 void onBinderDied(void* cookie) {
     (void)cookie;
     LOGE("Critical system binder service died! Requesting graceful restart...");
-    /* Reuse the normal shutdown path: set the flag and wake the event
-     * loop so it unwinds (closes fds) and main() exits cleanly,
-     * letting the supervising init restart us. Abrupt exit(0) would
-     * skip cleanup and is harsher on whatever depended on us. */
-    consumeShutdownSignal();
+    /* Do NOT call consumeShutdownSignal() here: that helper only promotes
+     * s_shutdown_signal_seen (set by SIGTERM/SIGINT) into g_shutdown_requested.
+     * Binder death never touches the signal flag, so consumeShutdownSignal()
+     * was a no-op and the daemon kept running against a dead handle.
+     * Set the shutdown flag directly and wake the epoll thread so it
+     * unwinds; main() then returns and the supervisor respawns us. */
+    atomic_store_explicit(&g_shutdown_requested, true, memory_order_release);
     triggerPollerWakeup();
 }
 
@@ -585,7 +615,7 @@ void resolveTransactionCodes(void) {
                     else if (strcmp(key, "TRANSACTION_getBrightness") == 0) get_brightness = val;
                     else if (strcmp(key, "TRANSACTION_onDisplayEvent") == 0) on_display_event = val;
                     else if (strcmp(key, "TRANSACTION_registerCallbackWithEventMask") == 0) register_cb_mask = val;
-                else if (strcmp(key, "TRANSACTION_registerCallback") == 0) register_cb = val;
+                    else if (strcmp(key, "TRANSACTION_registerCallback") == 0) register_cb = val;
                     else if (strcmp(key, "TRANSACTION_registerListener") == 0) {
                         register_batt_listener = val;
                         saw_register_batt_listener_zero = (val == 0);
